@@ -81,9 +81,20 @@ def _monotonic_int_schedule(L: int, target_sum: int, low: int, high: int) -> Lis
 
 
 def resolve_schedule(
-    name: str, L: int, baseline_keep_k: int, top_k: int, num_experts: int
+    name: str,
+    L: int,
+    baseline_keep_k: int,
+    top_k: int,
+    num_experts: int,
+    spread: Optional[int] = None,
 ) -> List[int]:
     """Resolve a preset name (or comma-separated list) to a per-layer pool schedule.
+
+    ``spread`` controls how far the extremes of a preset schedule deviate
+    from ``baseline_keep_k``. If unset, defaults to the maximum symmetric
+    spread allowed by the floor (``baseline_keep_k - top_k``). With
+    ``spread=8`` and ``baseline_keep_k=32``, ``up_step`` produces
+    ``[24]*L/2 + [40]*L/2``.
 
     Enforces: length == L, floor >= top_k (so top_k stays valid in every
     layer), ceiling <= num_experts, and for preset modes the schedule sums to
@@ -117,10 +128,19 @@ def resolve_schedule(
             f"baseline_keep_k ({baseline_keep_k}) must be <= num_experts ({num_experts})"
         )
 
-    low = top_k
-    # Symmetric spread around baseline: distance below the mean = distance above.
-    spread = baseline_keep_k - low
-    high = min(baseline_keep_k + spread, num_experts)
+    max_spread = min(baseline_keep_k - top_k, num_experts - baseline_keep_k)
+    if spread is None:
+        spread = max_spread
+    if spread < 0:
+        raise ValueError(f"spread must be >= 0, got {spread}")
+    if spread > max_spread:
+        raise ValueError(
+            f"spread={spread} exceeds max_spread={max_spread} "
+            f"(baseline={baseline_keep_k}, top_k={top_k}, num_experts={num_experts})"
+        )
+
+    low = baseline_keep_k - spread
+    high = baseline_keep_k + spread
 
     if name == "uniform":
         return [baseline_keep_k] * L
@@ -128,16 +148,11 @@ def resolve_schedule(
     if name == "up_step":
         if L % 2 != 0:
             raise ValueError("up_step requires even L")
-        # [low]*L/2 + [hi]*L/2 with average = baseline_keep_k
-        hi = 2 * baseline_keep_k - low
-        if hi > num_experts:
-            raise ValueError(
-                f"up_step would need high={hi} > num_experts={num_experts}"
-            )
-        return [low] * (L // 2) + [hi] * (L // 2)
+        return [low] * (L // 2) + [high] * (L // 2)
 
     if name == "down_step":
-        return list(reversed(resolve_schedule("up_step", L, baseline_keep_k, top_k, num_experts)))
+        return list(reversed(resolve_schedule(
+            "up_step", L, baseline_keep_k, top_k, num_experts, spread=spread)))
 
     if name == "up_linear":
         return _monotonic_int_schedule(L, target_sum, low=low, high=high)
@@ -184,6 +199,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "or comma-separated explicit list of length num_hidden_layers")
     p.add_argument("--baseline-keep-k", type=int, default=32,
                    help="Average per-layer pool size; sum target is baseline_keep_k * L (default 32)")
+    p.add_argument("--spread", type=int, default=None,
+                   help="How far the schedule extremes deviate from baseline_keep_k. "
+                        "Default is the maximum symmetric spread "
+                        "min(baseline-top_k, num_experts-baseline). "
+                        "Example: with baseline 32 and --spread 8, up_step gives [24]*L/2 + [40]*L/2.")
     p.add_argument("--output-dir", required=True,
                    help="Root output dir; per (schedule, task) subdirs are created beneath")
     p.add_argument("--num-shared-experts", type=int, default=1,
@@ -212,8 +232,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     L, num_experts, top_k = _read_config_baseline(args.model)
     print(f"[info] model baseline: L={L}, num_experts={num_experts}, top_k={top_k}")
 
-    schedule = resolve_schedule(args.schedule, L, args.baseline_keep_k, top_k, num_experts)
-    print(f"[info] schedule '{args.schedule}': {schedule}")
+    schedule = resolve_schedule(
+        args.schedule, L, args.baseline_keep_k, top_k, num_experts, spread=args.spread
+    )
+    print(f"[info] schedule '{args.schedule}' (spread={args.spread}): {schedule}")
     print(f"[info]   sum={sum(schedule)}  target={L*args.baseline_keep_k}  "
           f"min={min(schedule)}  max={max(schedule)}")
 
@@ -222,7 +244,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Sanitize schedule name for filesystem use.
     safe_name = args.schedule.replace(",", "_").replace("[", "").replace("]", "")
-    run_dir = Path(args.output_dir) / f"{safe_name}_kavg{args.baseline_keep_k}" / args.task
+    spread_tag = f"_spread{args.spread}" if args.spread is not None else ""
+    run_dir = (
+        Path(args.output_dir)
+        / f"{safe_name}_kavg{args.baseline_keep_k}{spread_tag}"
+        / args.task
+    )
     pruned_dir = run_dir / "pruned_model"
     eval_dir = run_dir / "eval"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -234,6 +261,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "schedule_name": args.schedule,
         "schedule": schedule,
         "baseline_keep_k": args.baseline_keep_k,
+        "spread": args.spread,
         "target_sum": L * args.baseline_keep_k,
         "L": L,
         "num_experts_full": num_experts,
