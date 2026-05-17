@@ -135,6 +135,99 @@ than when they're uniform?), or (c) random-keep ablations to estimate
 the noise floor for "any reasonable subset of 31 standard experts" at
 each layer.
 
+## Follow-up experiment: global-rank schedule
+
+The preset sweep restricts per-layer `keep_k` to coarse step / linear
+shapes. A more principled non-uniform schedule is one that maximises the
+*total preserved activation mass* under a fixed budget. The construction:
+
+1. Take the standard-only `avg_probs` (L × 127).
+2. Flatten and rank all `(layer, expert)` pairs globally by their mass.
+3. Keep the top `L × 31 = 496` standard experts globally; add 1 shared
+   per layer to match the baseline total budget of 512.
+4. The number of standard experts each layer ends up with is the per-layer
+   keep count under "global competition".
+
+For Emo_1b14b_1T on ARC-c, this construction yields the schedule:
+
+```
+[44, 39, 30, 35, 33, 32, 32, 29, 25, 25, 34, 38, 29, 30, 29, 28]
+```
+
+The sum is 512 (matching uniform-32). The shape mirrors the head-shape
+analysis above: layers 0–1 (shallowest heads) get the most experts, layers
+8–9 (most concentrated) get the fewest.
+
+![Per-layer keep_k: uniform vs global-rank](global_rank_schedule_arc_c.png)
+
+### Per-layer mass redistribution
+
+| layer | keep\_uni | keep\_glob | Δkeep | mass\_uni | mass\_glob | Δmass    |
+|------:|----------:|-----------:|------:|----------:|-----------:|---------:|
+|     0 |        31 |         43 |   +12 |    0.4842 |     0.5804 |  +0.0962 |
+|     1 |        31 |         38 |    +7 |    0.6160 |     0.6731 |  +0.0571 |
+|     2 |        31 |         29 |    −2 |    0.7138 |     0.6990 |  −0.0148 |
+|     3 |        31 |         34 |    +3 |    0.7130 |     0.7370 |  +0.0240 |
+|     4 |        31 |         32 |    +1 |    0.7451 |     0.7527 |  +0.0076 |
+|     5 |        31 |         31 |     0 |    0.7400 |     0.7400 |   0.0000 |
+|     6 |        31 |         31 |     0 |    0.7943 |     0.7943 |   0.0000 |
+|     7 |        31 |         28 |    −3 |    0.7569 |     0.7349 |  −0.0220 |
+|     8 |        31 |         24 |    −7 |    0.8109 |     0.7658 |  −0.0451 |
+|     9 |        31 |         24 |    −7 |    0.7802 |     0.7328 |  −0.0474 |
+|    10 |        31 |         33 |    +2 |    0.7530 |     0.7687 |  +0.0157 |
+|    11 |        31 |         37 |    +6 |    0.7604 |     0.8094 |  +0.0490 |
+|    12 |        31 |         28 |    −3 |    0.8097 |     0.7891 |  −0.0206 |
+|    13 |        31 |         29 |    −2 |    0.7820 |     0.7678 |  −0.0143 |
+|    14 |        31 |         28 |    −3 |    0.7776 |     0.7555 |  −0.0220 |
+|    15 |        31 |         27 |    −4 |    0.8032 |     0.7756 |  −0.0276 |
+| **total** | 496   | 496        | **0** |  11.8403  |    11.8761 | **+0.0358** |
+
+### Accuracy result
+
+| schedule        | sum kept | mass captured | acc\_uncond | Δ vs uniform |
+|-----------------|---------:|--------------:|------------:|-------------:|
+| `uniform` (32)  |      512 |        11.840 |     0.5452  |  baseline    |
+| **global-rank** |      512 |    **11.876** | **0.5217**  | **−2.3**     |
+
+**The schedule that strictly maximises preserved activation mass loses
+2.3 absolute points to uniform.** This is the same prune+eval pipeline
+on the same calibration data; the only thing that differs is which 31
+standard experts each layer keeps.
+
+### Why mass isn't the right currency
+
+Reading the per-layer trade: the global-rank schedule takes 7 experts
+from layer 8 (mass loss 0.045) and gives 12 experts to layer 0 (mass gain
+0.096). In *mass* terms this is a clear win — 2× more gained than lost.
+In *accuracy* terms it's a loss. So each expert at the rank-25-to-31
+boundary of layer 8 (a concentrated layer) carries more accuracy weight
+than the experts gained at the rank-31-to-43 boundary of layer 0 (a broad
+layer).
+
+Three readings, all consistent with this and with the
+[sweep](arc_pool_sweep_2026-05-17.md):
+
+1. **Average mass dilutes rare critical routes.** A late-layer expert
+   with average probability 0.005 may fire decisively for a small subset
+   of tokens. The greedy average smooths over the burst.
+2. **Concentrated layers are specialised; broad ones are
+   exploratory.** The wide tail of layer 0 may just be the
+   pre-specialisation residue of routing in shallow layers, where the
+   model hasn't yet "decided" on a domain — adding more of those experts
+   doesn't recover useful capacity. Conversely, a concentrated late
+   layer's tail experts are the ones encoding minority-but-important
+   token routes.
+3. **The greedy ranking is the wrong objective.** Mass preservation
+   isn't the same as activation preservation; alternative criteria
+   (gradient × activation, calibration-loss attribution, top-1
+   selection frequency rather than soft probability) might restore a
+   useful signal.
+
+This is a clean negative result for the most natural "smart" schedule
+under the same calibration data the sweep used. It suggests the uniform
+baseline is hard to beat without changing the importance criterion or
+the pruning algorithm itself.
+
 ## Artifacts
 
 Raw data, plots, and the per-layer JSON live at:
