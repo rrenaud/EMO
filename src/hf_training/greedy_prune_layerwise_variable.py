@@ -66,19 +66,15 @@ def greedy_prune_layerwise_variable(
         device: Device override; defaults to "auto" (multi-GPU if available)
     """
     logger.info(f"Loading model: {model_name}")
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=config,
         torch_dtype=torch.bfloat16,
         device_map="auto" if device is None else device,
+        trust_remote_code=True,
     )
-    # model = EmoForCausalLMDebug.from_pretrained(
-    #     model_name,
-    #     torch_dtype=torch.bfloat16,
-    #     device_map="auto" if device is None else device,
-    # )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -186,7 +182,12 @@ def greedy_prune_layerwise_variable(
 
             with torch.no_grad():
                 try:
-                    model(**batch_on_device)
+                    # output_router_logits=False skips load_balancing_loss_func_olmoe,
+                    # which torch.stack's per-layer router logits and fails once any
+                    # layer has been pruned to a different num_experts. The per-layer
+                    # capture hook above still fires because routing happens inside
+                    # each MoE block regardless of this flag.
+                    model(**batch_on_device, output_router_logits=False)
                 except EarlyExit:
                     pass
 
