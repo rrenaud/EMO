@@ -86,6 +86,7 @@ claude_outputs
 eval_plots/.mplconfig
 *.csv
 *.html
+!results/*.html
 prune_evals_final
 extension_evals_0414
 extension_evals_hf

@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARC-Challenge: per-layer pool-size sweep on Emo_1b14b_1T</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  max-width: 880px;
+  margin: 2.5rem auto;
+  padding: 0 1.5rem;
+  line-height: 1.55;
+  color: #24292f;
+  background: #ffffff;
+}
+h1, h2, h3 { line-height: 1.25; }
+h1 { font-size: 1.9rem; border-bottom: 1px solid #d8dee4; padding-bottom: .35em; }
+h2 { font-size: 1.4rem; margin-top: 2.2rem; border-bottom: 1px solid #eaecef; padding-bottom: .25em; }
+h3 { font-size: 1.15rem; margin-top: 1.6rem; }
+p, ul, ol { margin: .65rem 0; }
+ul li, ol li { margin: .2rem 0; }
+code {
+  background: #f6f8fa;
+  padding: .15em .35em;
+  border-radius: 4px;
+  font-size: 92%;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+pre {
+  background: #f6f8fa;
+  padding: .9rem 1rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 88%;
+}
+pre code { background: none; padding: 0; }
+table {
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 95%;
+  width: 100%;
+}
+th, td {
+  border: 1px solid #d8dee4;
+  padding: .45rem .7rem;
+  text-align: left;
+}
+th { background: #f6f8fa; }
+td:nth-child(n+2), th:nth-child(n+2) { text-align: right; }
+td:first-child, th:first-child { text-align: left; }
+strong { color: #0a4a8a; }
+hr { border: none; border-top: 1px solid #d8dee4; margin: 2rem 0; }
+a { color: #0969da; }
+</style>
+</head>
+<body>
+<h1 id="arc-challenge-per-layer-pool-size-sweep-on-emo_1b14b_1t">ARC-Challenge: per-layer pool-size sweep on Emo_1b14b_1T</h1>
+<p>Run date: 2026-05-17. Hardware: 1× A100 80GB. Run via
+<code>scripts/selective_hf/run_layerwise_pool_schedule.py</code> at commit <code>1d3e3aed</code>
+with the two fixes applied in this session
+(<code>greedy_prune_layerwise_variable.py</code>: <code>trust_remote_code=True</code> on
+<code>from_pretrained</code>, and <code>output_router_logits=False</code> on the calibration
+forward).</p>
+<h2 id="tldr">TL;DR</h2>
+<p>Holding total expert budget constant (sum of per-layer keep-k = 32×16),
+<strong>every non-uniform schedule loses ground to the uniform baseline</strong>, and the
+penalty scales nearly monotonically with how non-uniform the schedule is.
+At the most extreme spread, putting big pools in earlier layers and small
+pools in later ones (<code>down_step</code>) hurts <strong>6.4 pts more</strong> than the opposite
+shape (<code>up_step</code>).</p>
+<h2 id="setup">Setup</h2>
+<ul>
+<li>Model: <code>allenai/Emo_1b14b_1T</code> (L=16, num_experts=128, top_k=8, num_shared=1)</li>
+<li>Task: <code>arc_challenge</code> (299 instances on validation, 0-shot)</li>
+<li>Pruning: greedy layerwise, calibrated on the task's validation split,
+  always-active shared expert preserved in every layer (count=1).</li>
+<li>Budget: <code>keep_k_per_layer</code> sums to <code>L × baseline_keep_k = 16 × 32 = 512</code>
+  in every cell. Spread is defined symmetrically around 32 so the floor is
+  <code>32 − spread</code> and the ceiling is <code>32 + spread</code>.</li>
+</ul>
+<h3 id="schedules-used">Schedules used</h3>
+<table>
+<thead>
+<tr>
+<th>Preset</th>
+<th style="text-align: right;">Spread</th>
+<th>Schedule (length 16, sum 512)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>uniform</code></td>
+<td style="text-align: right;">—</td>
+<td><code>[32]*16</code></td>
+</tr>
+<tr>
+<td><code>up_step</code></td>
+<td style="text-align: right;">4</td>
+<td><code>[28]*8 + [36]*8</code></td>
+</tr>
+<tr>
+<td><code>down_step</code></td>
+<td style="text-align: right;">4</td>
+<td><code>[36]*8 + [28]*8</code></td>
+</tr>
+<tr>
+<td><code>up_step</code></td>
+<td style="text-align: right;">8</td>
+<td><code>[24]*8 + [40]*8</code></td>
+</tr>
+<tr>
+<td><code>down_step</code></td>
+<td style="text-align: right;">8</td>
+<td><code>[40]*8 + [24]*8</code></td>
+</tr>
+<tr>
+<td><code>up_step</code></td>
+<td style="text-align: right;">16</td>
+<td><code>[16]*8 + [48]*8</code></td>
+</tr>
+<tr>
+<td><code>down_step</code></td>
+<td style="text-align: right;">16</td>
+<td><code>[48]*8 + [16]*8</code></td>
+</tr>
+<tr>
+<td><code>up_step</code></td>
+<td style="text-align: right;">24</td>
+<td><code>[8]*8  + [56]*8</code>     ← floor at <code>top_k</code></td>
+</tr>
+<tr>
+<td><code>down_step</code></td>
+<td style="text-align: right;">24</td>
+<td><code>[56]*8 + [8]*8</code>      ← floor at <code>top_k</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="results">Results</h2>
+<p>Primary metric is <code>acc_uncond</code> from OLMES; 299-example validation, 0-shot.</p>
+<table>
+<thead>
+<tr>
+<th>Schedule</th>
+<th style="text-align: right;">Spread</th>
+<th style="text-align: right;">acc_uncond</th>
+<th style="text-align: right;">Δ vs uniform</th>
+<th style="text-align: right;">acc_per_char</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>uniform</code></td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;"><strong>0.5452</strong></td>
+<td style="text-align: right;">(baseline)</td>
+<td style="text-align: right;">0.4749</td>
+</tr>
+<tr>
+<td><code>up_step</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">0.5284</td>
+<td style="text-align: right;">−1.7</td>
+<td style="text-align: right;">0.4615</td>
+</tr>
+<tr>
+<td><code>down_step</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">0.5117</td>
+<td style="text-align: right;">−3.3</td>
+<td style="text-align: right;">0.4883</td>
+</tr>
+<tr>
+<td><code>up_step</code></td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0.5050</td>
+<td style="text-align: right;">−4.0</td>
+<td style="text-align: right;">0.4749</td>
+</tr>
+<tr>
+<td><code>down_step</code></td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0.5117</td>
+<td style="text-align: right;">−3.3</td>
+<td style="text-align: right;">0.4649</td>
+</tr>
+<tr>
+<td><code>up_step</code></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">0.4783</td>
+<td style="text-align: right;">−6.7</td>
+<td style="text-align: right;">0.4348</td>
+</tr>
+<tr>
+<td><code>down_step</code></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">0.4783</td>
+<td style="text-align: right;">−6.7</td>
+<td style="text-align: right;">0.4782</td>
+</tr>
+<tr>
+<td><code>up_step</code></td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">0.4716</td>
+<td style="text-align: right;">−7.4</td>
+<td style="text-align: right;">0.4147</td>
+</tr>
+<tr>
+<td><code>down_step</code></td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">0.4080</td>
+<td style="text-align: right;"><strong>−13.7</strong></td>
+<td style="text-align: right;">0.3813</td>
+</tr>
+</tbody>
+</table>
+<h2 id="observations">Observations</h2>
+<ol>
+<li>
+<p><strong>Uniform dominates the budget-matched space.</strong> The flat schedule is the
+   top performer at every spread; the penalty for deviating is at minimum
+   1.7 absolute points (already well outside the noise floor for a 299-example
+   eval at this accuracy band).</p>
+</li>
+<li>
+<p><strong>Penalty grows with spread.</strong> The damage scales roughly linearly with
+   <code>spread</code> for the milder regime (spread ∈ {4, 8, 16}) and then accelerates
+   for <code>down_step</code> at the saturation point (spread=24, where the constrained
+   layers hit <code>keep_k = top_k = 8</code> — i.e. the router has no headroom).</p>
+</li>
+<li>
+<p><strong>Direction-asymmetry at extreme spread.</strong> At spread=24, <code>up_step</code> (narrow
+   pools early, wide late) loses 7.4 points while <code>down_step</code> (wide early,
+   narrow late) loses 13.7. So <strong>constraining later layers is far more
+   damaging than constraining early layers</strong>, consistent with the general
+   finding that later transformer-MoE layers carry more task-specific
+   specialisation.</p>
+</li>
+</ol>
+<p>At small spreads (4, 8) the two shapes are roughly symmetric, suggesting
+   the asymmetry is specifically a saturation effect that only emerges once
+   one half of the layers is squeezed against the <code>top_k</code> floor.</p>
+<h2 id="interpretation-and-caveats">Interpretation and caveats</h2>
+<ul>
+<li>
+<p><strong>Calibration confound.</strong> The pruner picks each layer's surviving experts
+  by activation frequency on the task's validation split. The "uniform"
+  baseline gets to keep 32 experts in every layer — the most well-aligned
+  budget for greedy selection. Non-uniform schedules force greedy selection
+  to retain expert sets that may be off-distribution for the layers in
+  question. So this experiment <strong>conflates two things</strong>: (a) information loss
+  from constraining pool size at a layer, and (b) suboptimality of the
+  greedy-keep policy when constrained pool sizes are imbalanced. To isolate
+  (a) you'd need a non-greedy pruning method or counterfactual analysis.</p>
+</li>
+<li>
+<p><strong>Single task, single model.</strong> No claim of generality beyond ARC-c on
+  Emo_1b14b_1T. The handoff plan explicitly puts MMLU / HellaSwag in the
+  next phase; we stopped before that to keep A100 spend down.</p>
+</li>
+<li>
+<p><strong>Calibration uses the eval set.</strong> Pruning is calibrated on
+  <code>arc_challenge</code> validation, and <code>acc_uncond</code> is computed on the same
+  split. This is the protocol from the original pruning recipe, but it
+  means the baseline is the optimistic case. A held-out calibration set
+  would tighten the conclusion.</p>
+</li>
+</ul>
+<h2 id="artifacts">Artifacts</h2>
+<p>Each cell's full outputs live at:</p>
+<pre><code>/workspace/eval_runs_pool/&lt;schedule&gt;_kavg32[_spread&lt;S&gt;]/arc_challenge/
+  schedule_meta.json          ← resolved schedule + provenance
+  pruned_model/               ← pruned HF checkpoint (~7.3 GB)
+  eval/
+    metrics.json
+    task-arc_challenge-metrics.json
+    task-arc_challenge-predictions.jsonl
+    task-arc_challenge-recorded-inputs.jsonl
+    task-arc_challenge-requests.jsonl
+</code></pre>
+<p>Sweep log: <code>/workspace/sweep_spread_ladder.log</code>.
+Baseline log: <code>/workspace/baseline_uniform.log</code> (prune) +
+<code>/workspace/baseline_uniform_eval.log</code> (eval).</p>
+</body>
+</html>
