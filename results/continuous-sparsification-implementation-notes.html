@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Continuous Sparsification for EMO — Implementation Notes &amp; Results</title>
+<style>
+  :root{
+    --bg:#fafaf8; --fg:#1d1d1f; --muted:#5f5f6b; --rule:#e3e3dd;
+    --accent:#7b4fc4; --accent2:#1f7a6b; --code-bg:#f3f2ee; --code-fg:#2a2a34;
+    --warn-bg:#fff7e6; --warn-br:#e8c873; --good-bg:#eef7f0; --good-br:#8fc7a3;
+    --note-bg:#eef2fb; --note-br:#9fb4e0;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  .wrap{max-width:920px; margin:0 auto; padding:48px 28px 96px}
+  header.title{border-bottom:3px solid var(--accent); padding-bottom:18px; margin-bottom:8px}
+  header.title h1{font-size:30px; line-height:1.2; margin:0 0 6px}
+  header.title .sub{color:var(--muted); font-size:15px}
+  .meta{color:var(--muted); font-size:13px; margin:10px 0 34px}
+  h2{font-size:22px; margin:46px 0 12px; padding-top:8px; border-top:1px solid var(--rule)}
+  h2 .n{color:var(--accent); font-variant-numeric:tabular-nums; margin-right:10px}
+  h3{font-size:17px; margin:26px 0 8px; color:var(--accent2)}
+  p{margin:10px 0}
+  ul,ol{margin:10px 0 10px 4px; padding-left:22px}
+  li{margin:5px 0}
+  code{background:var(--code-bg); color:var(--code-fg); padding:1.5px 5px; border-radius:4px;
+    font:13.5px/1.5 "SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace}
+  .path{color:var(--accent2); white-space:nowrap}
+  pre{background:var(--code-bg); color:var(--code-fg); padding:16px 18px; border-radius:8px;
+    overflow:auto; border:1px solid var(--rule);
+    font:13px/1.55 "SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace}
+  pre code{background:none; padding:0}
+  .eq{background:#fff; border:1px solid var(--rule); border-left:4px solid var(--accent);
+    padding:12px 18px; margin:16px 0; border-radius:6px; font-size:17px; overflow-x:auto}
+  .eq .lbl{float:right; color:var(--muted); font-size:12px; font-style:italic}
+  .callout{padding:12px 16px; border-radius:8px; margin:16px 0; font-size:15px}
+  .note{background:var(--note-bg); border:1px solid var(--note-br)}
+  .warn{background:var(--warn-bg); border:1px solid var(--warn-br)}
+  .good{background:var(--good-bg); border:1px solid var(--good-br)}
+  .callout b{font-weight:650}
+  table{border-collapse:collapse; width:100%; margin:18px 0; font-size:14px}
+  th,td{border:1px solid var(--rule); padding:8px 11px; text-align:left; vertical-align:top}
+  th{background:#f0eef9; font-weight:650}
+  tbody tr:nth-child(even){background:#fff}
+  td.num,th.num{text-align:right; font-variant-numeric:tabular-nums}
+  .toc{background:#fff; border:1px solid var(--rule); border-radius:8px; padding:14px 20px; margin:20px 0 8px}
+  .toc h4{margin:0 0 8px; font-size:13px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted)}
+  .toc ol{columns:2; column-gap:36px; margin:0; padding-left:20px; font-size:14px}
+  .toc a{color:var(--fg); text-decoration:none}
+  .toc a:hover{color:var(--accent); text-decoration:underline}
+  .tag{display:inline-block; font-size:11px; font-weight:650; letter-spacing:.04em;
+    padding:2px 8px; border-radius:20px; background:#efe9fb; color:var(--accent); margin-left:8px; vertical-align:middle}
+  .tag.ok{background:#eaf3f0; color:var(--accent2)}
+  .tag.wip{background:var(--warn-bg); color:#9a7b1e}
+  var{font-style:italic; font-family:Georgia,"Times New Roman",serif}
+  sub,sup{font-size:.72em}
+  .bar{display:inline-block; height:11px; background:var(--accent); border-radius:2px; vertical-align:middle}
+  footer{margin-top:60px; padding-top:16px; border-top:1px solid var(--rule); color:var(--muted); font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="title">
+  <h1>Continuous Sparsification for EMO Expert Selection</h1>
+  <div class="sub">Implementation notes &amp; verification results — the as-built fourth expert-pruning method</div>
+</header>
+<div class="meta">
+  Repo: <code>EMO</code> (ModMoE / OLMo-core fork) · Branch: <code>layerwise-shared-experts</code> ·
+  Method: Savarese, Silva &amp; Maire, &ldquo;Winning the Lottery with Continuous Sparsification,&rdquo; NeurIPS 2020 ·
+  Verified on a single H100 80GB against <code>allenai/Emo_1b14b_1T</code> / <code>arc_challenge</code>.
+  Companion to the design doc <span class="path">results/continous-sparsification-implementation.html</span>.
+</div>
+
+<div class="toc">
+  <h4>Contents</h4>
+  <ol>
+    <li><a href="#what">What was built</a></li>
+    <li><a href="#how">How it works</a></li>
+    <li><a href="#decisions">Implementation decisions &amp; gotchas</a></li>
+    <li><a href="#cli">CLI &amp; usage</a></li>
+    <li><a href="#verify">Verification on H100</a></li>
+    <li><a href="#global">The global-allocation result</a></li>
+    <li><a href="#pipeline">End-to-end pipeline</a></li>
+    <li><a href="#env">Environment notes</a></li>
+    <li><a href="#status">Status &amp; next steps</a></li>
+  </ol>
+</div>
+
+<h2 id="what"><span class="n">1</span>What was built</h2>
+<p>
+EMO models can be pruned to a small task-specific subset of experts while keeping most of
+their accuracy. The repo already shipped three selection methods (greedy layerwise, easy_ep,
+random), each of which scores experts cheaply (≈ one forward pass) and cuts by frequency /
+importance, emitting a structurally-pruned model plus a <code>pruning_metadata.json</code>.
+This adds a <b>fourth, loss-aware</b> method: <b>Continuous Sparsification (CS)</b>.
+</p>
+<p>Instead of a passive forward pass, CS attaches a learnable logit to every routed expert,
+gates the expert by a temperature-scaled sigmoid, <b>freezes all model weights</b>, and runs a
+short calibration loop that trains only those mask logits (plus an L1 sparsity penalty) while
+annealing the temperature upward. The soft mask hardens toward a boolean decision, which is
+then <b>baked into a structural prune</b> via the existing in-place prune kernel — producing the
+exact same artifact the other methods produce, so it drops straight into the existing
+finetune / eval pipeline with <b>zero inference overhead</b>.</p>
+
+<h3>Files</h3>
+<table>
+  <thead><tr><th>File</th><th>Status</th><th>What</th></tr></thead>
+  <tbody>
+    <tr><td><span class="path">src/hf_training/continuous_sparsify_prune.py</span></td><td><span class="tag ok">new</span></td>
+      <td>Standalone CS pruning script (~510 lines). Mirrors the CLI/structure of the sibling prune scripts and reuses <code>prune_moe_layer_inplace</code>, <code>_is_moe_layer</code>, <code>_capture_layer_output</code>.</td></tr>
+    <tr><td><span class="path">scripts/selective_hf/hf_finetune_with_selective_continuous.sh</span></td><td><span class="tag ok">new</span></td>
+      <td>Orchestration wrapper: select → finetune → eval, copied from the easy_ep wrapper with the selection step swapped and CS flags forwarded.</td></tr>
+    <tr><td><span class="path">src/hf_training/easy_ep_prune.py</span></td><td><span class="tag wip">1-line fix</span></td>
+      <td>Added <code>trust_remote_code=True</code> to its model/config/tokenizer load (it was the only prune script missing it, which blocked loading custom-code EMO checkpoints). Matches what <code>greedy_prune_layerwise.py</code> already does.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="how"><span class="n">2</span>How it works</h2>
+
+<h3>The objective</h3>
+<p>Every standard (routed) expert <var>e</var> gets a learnable logit <var>s<sub>e</sub></var>. During calibration the expert's
+contribution is gated by a temperature-scaled sigmoid; the loss adds an L1 penalty on the soft gates:</p>
+<div class="eq"><span class="lbl">CS objective</span>
+&#8466; = &#8466;<sub>task</sub>( … &middot; &sigma;(&beta; <var>s<sub>e</sub></var>) … ) + &lambda; &sum;<sub>e</sub> &sigma;(&beta; <var>s<sub>e</sub></var>)
+</div>
+<p>As <var>&beta;</var> is annealed upward (1 → 200), &sigma;(&beta; <var>s<sub>e</sub></var>) hardens toward the step function
+<var>H</var>(<var>s<sub>e</sub></var>), so the keep/drop decision becomes &ldquo;<var>s<sub>e</sub></var> ≥ 0&rdquo;.</p>
+
+<h3>(a) Mask attachment by runtime monkeypatch</h3>
+<p>
+The class that actually executes for a checkpoint is the <b>hub copy</b> of <code>modeling_emo.py</code>
+(loaded via <code>trust_remote_code</code>), not the in-repo source — so the mask is injected by
+<b>monkeypatching loaded block instances</b>, never by editing <code>modeling_emo.py</code>. For each MoE
+layer we register a trainable <code>nn.Parameter cs_mask_logits</code> of shape <code>(num_standard,)</code>
+(init <code>s_init=3.0</code> ⇒ all gates start ≈ 1), store a mutable python float <code>cs_beta</code>, and replace
+<code>.forward</code> with a bound method that re-implements the known forward with one change right
+before the expert loop:
+</p>
+<pre><code>mask_std = torch.sigmoid(self.cs_beta * self.cs_mask_logits)        # (num_standard,) float
+full_mask = torch.cat([mask_std, torch.ones(self.num_shared_experts)])  # shared fixed at 1
+routing_weights = routing_weights * full_mask[selected_experts]    # in float, BEFORE the bf16 cast</code></pre>
+<p>Shared (trailing) experts are gathered at a fixed gate of 1, so they are never pruned. A handle to
+the original forward is kept so it can be restored before saving.</p>
+
+<h3>(b) Freeze + optimizer</h3>
+<pre><code>for p in model.parameters(): p.requires_grad_(False)
+mask_params = [blk.cs_mask_logits for blk in moe_blocks]
+for m in mask_params: m.requires_grad_(True)
+opt = torch.optim.Adam(mask_params, lr=args.lr)</code></pre>
+
+<h3>(c) Calibration loop</h3>
+<p>A <code>DataLoader</code> is built from <code>load_finetuning_dataset(...)</code> + <code>MaskedLossDataCollator</code>
+(reused from <span class="path">finetune.py</span>), seeded-subsampled to <code>--num-calibration</code>. Per step:</p>
+<ol>
+  <li>Forward the model; compute <b>CE manually</b> from <code>logits</code> + shifted <code>labels</code> (<code>ignore_index=-100</code>) — avoids contaminating the loss with the model's router aux loss (which is also disabled via <code>output_router_logits=False</code>).</li>
+  <li><code>penalty = &lambda; &middot; &sum;<sub>layers,e</sub> &sigma;(&beta; s<sub>e</sub>)</code> computed directly from the params, so even never-selected experts get pushed off.</li>
+  <li><code>loss = ce + penalty</code>; backward; <code>clip_grad_norm_</code>; <code>opt.step()</code>.</li>
+  <li>Update <var>&beta;</var> on every block via an <b>exponential schedule</b> from <code>--beta-start</code> to <code>--beta-end</code>.</li>
+  <li>Log mean gate, fraction <code>s<sub>e</sub>&ge;0</code>, ce, penalty.</li>
+</ol>
+
+<h3>(d) Selection → keep-set</h3>
+<p>Final score = <var>s<sub>e</sub></var> (monotonic in &sigma;). Shared indices are always appended. Three modes:</p>
+<ul>
+  <li><b><code>per_layer</code></b> — top <code>(keep_k − num_shared)</code> standard experts per layer ⇒ uniform keep_k.</li>
+  <li><b><code>global</code></b> — rank all standard experts across MoE layers; keep a global budget of <code>(keep_k − num_shared) × num_moe_layers</code> ⇒ per-layer counts vary.</li>
+  <li><b><code>threshold</code></b> — keep standard experts with <code>s<sub>e</sub> ≥ 0</code> (emergent count, pure CS); a guard keeps at least the single best expert so a layer is never emptied.</li>
+</ul>
+
+<h3>(e) Bake + save</h3>
+<p>Restore the original forward, drop the training-only mask param, run the before/after hidden-state
+sanity check, then call <code>prune_moe_layer_inplace(...)</code> per layer. The config update +
+<code>save_pretrained</code> + <code>pruning_metadata.json</code> block mirrors
+<span class="path">greedy_prune_layerwise_variable.py</span>, tagged
+<code>pruning_method="continuous_sparsification"</code> with the CS hyperparameters and
+<code>keep_k_per_layer</code> / <code>experts_kept_per_layer</code>.</p>
+
+<h2 id="decisions"><span class="n">3</span>Implementation decisions &amp; gotchas</h2>
+<ul>
+  <li><b>Monkeypatch, don't edit the model source.</b> The executed class is the hub copy, so editing the in-repo <code>modeling_emo.py</code> would have no effect. Patched instances re-implement the <code>num_shared_experts ≥ 0</code> paths faithfully; the <code>always_active_experts</code> masked path raises <code>NotImplementedError</code> (its semantics conflict with masking) — same stance as easy_ep.</li>
+  <li><b>Multiply the mask in float, before the bf16 cast.</b> The original forward casts <code>routing_weights</code> to the hidden dtype (bf16); applying the gate before that cast keeps the mask gradient out of the bf16 round-trip.</li>
+  <li><b>Manual CE, router aux loss off.</b> Passing <code>labels</code> to the model would mix in the load-balancing aux loss; computing CE by hand isolates the task signal that should drive the masks.</li>
+  <li><b>Penalty over <em>all</em> experts, not just selected ones.</b> Computed straight from the parameters, so experts that never appear in any token's top-k are still pushed toward 0.</li>
+  <li><b>Shared experts are never masked.</b> Their gate is a fixed 1, matching the repo convention that shared experts occupy the trailing <code>num_shared</code> indices.</li>
+  <li><b>&lambda; is a sharp knob (and only bites in <code>threshold</code> mode).</b> In <code>per_layer</code>/<code>global</code> the budget is fixed by top-k, so &lambda; barely matters. In <code>threshold</code> it decides the emergent count — see the §5 threshold run, where &lambda;=0.2 collapsed every layer to the guard floor.</li>
+</ul>
+
+<h2 id="cli"><span class="n">4</span>CLI &amp; usage</h2>
+<pre><code># Standalone selection (emits a pruned model + pruning_metadata.json)
+python -m src.hf_training.continuous_sparsify_prune \
+    --model allenai/Emo_1b14b_1T --task arc_challenge --split train \
+    --prune-keep-k 32 --num-shared-experts 1 \
+    --selection-mode global \
+    --num-calibration 256 --num-steps 200 \
+    --lr 0.1 --beta-start 1.0 --beta-end 200.0 --s-init 3.0 \
+    --batch-size 4 --trust-remote-code \
+    --save-path /path/to/selected_model
+
+# Full pipeline (select -> finetune -> eval)
+./scripts/selective_hf/hf_finetune_with_selective_continuous.sh \
+    --model allenai/Emo_1b14b_1T --task arc_challenge \
+    --selective-keep-k 32 --num-shared-experts 1 \
+    --num-selective-examples 256 --selection-mode global \
+    --base-dir /out --relative-dir arc_challenge_cs --run-name cs_global --num-gpus 1</code></pre>
+<p>Existing flags match the sibling scripts (<code>--model --task --split --prune-keep-k
+--num-shared-experts --save-path --batch-size --num-calibration --num-shots --prune-seed
+--trust-remote-code</code>). CS-specific: <code>--selection-mode --lambda --lr --num-steps
+--beta-start --beta-end --s-init --max-seq-length --grad-clip</code>.</p>
+
+<h2 id="verify"><span class="n">5</span>Verification on H100</h2>
+<p>All three selection modes ran end-to-end on the real model and produced loadable artifacts. The
+before/after hidden-state sanity check passed in every run.</p>
+<table>
+  <thead><tr><th>Mode</th><th>Config</th><th>Outcome</th></tr></thead>
+  <tbody>
+    <tr><td><b>per_layer</b></td><td>16 cal / 50 steps</td><td>Every layer → keep_k = 32 (31 standard + 1 shared). Uniform, as designed. Artifact reloads via <code>AutoModelForCausalLM(trust_remote_code=True)</code>, <code>config.num_experts=32</code>, finite forward. <span class="tag ok">pass</span></td></tr>
+    <tr><td><b>global</b></td><td>16 cal / 50 steps</td><td>Variable schedule summing to the exact budget (496 standard); learned a non-uniform allocation. <span class="tag ok">pass</span></td></tr>
+    <tr><td><b>threshold</b></td><td>16 cal / 120 steps, &lambda;=0.2</td><td>Emergent count works; &lambda;=0.2 over-pruned (penalty crushed all gates by step ~24, CE rose 4.3→6.0), so every layer hit the &ldquo;never empty&rdquo; guard floor of 1+1. A clean demonstration of &lambda;-sensitivity. <span class="tag ok">pass</span></td></tr>
+  </tbody>
+</table>
+<div class="callout note">The 16-example / 50-step settings above are a <b>smoke configuration</b> — enough to exercise every code path and confirm artifacts, <b>not</b> enough to claim accuracy. Mask logits barely differentiate in 50 steps on 16 examples (<code>mean_gate</code> stayed ≈ 1.0, <code>frac(s≥0)=1.0</code>), so the per_layer selection there is close to arbitrary.</div>
+
+<h2 id="global"><span class="n">6</span>The global-allocation result</h2>
+<p>
+The most interesting cell is <b>global</b>, the only mode that can express a non-uniform per-layer
+budget that the uniform baselines structurally cannot. With a proper 256-example / 200-step
+calibration (keep_k=32, 1 shared, &beta; 1→200), CS spent its budget of 496 standard experts like
+this — concentrating capacity in early layers and pruning late layers hard:
+</p>
+<table>
+  <thead><tr><th>Layer</th><th class="num">standard kept</th><th>allocation (of 127)</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td class="num">65</td><td><span class="bar" style="width:260px"></span></td></tr>
+    <tr><td>1</td><td class="num">57</td><td><span class="bar" style="width:228px"></span></td></tr>
+    <tr><td>2</td><td class="num">41</td><td><span class="bar" style="width:164px"></span></td></tr>
+    <tr><td>3</td><td class="num">40</td><td><span class="bar" style="width:160px"></span></td></tr>
+    <tr><td>4</td><td class="num">38</td><td><span class="bar" style="width:152px"></span></td></tr>
+    <tr><td>5</td><td class="num">45</td><td><span class="bar" style="width:180px"></span></td></tr>
+    <tr><td>6</td><td class="num">35</td><td><span class="bar" style="width:140px"></span></td></tr>
+    <tr><td>7</td><td class="num">39</td><td><span class="bar" style="width:156px"></span></td></tr>
+    <tr><td>8</td><td class="num">29</td><td><span class="bar" style="width:116px"></span></td></tr>
+    <tr><td>9</td><td class="num">26</td><td><span class="bar" style="width:104px"></span></td></tr>
+    <tr><td>10</td><td class="num">22</td><td><span class="bar" style="width:88px"></span></td></tr>
+    <tr><td>11</td><td class="num">17</td><td><span class="bar" style="width:68px"></span></td></tr>
+    <tr><td>12</td><td class="num">17</td><td><span class="bar" style="width:68px"></span></td></tr>
+    <tr><td>13</td><td class="num">11</td><td><span class="bar" style="width:44px"></span></td></tr>
+    <tr><td>14</td><td class="num">7</td><td><span class="bar" style="width:28px"></span></td></tr>
+    <tr><td>15</td><td class="num">7</td><td><span class="bar" style="width:28px"></span></td></tr>
+  </tbody>
+</table>
+<p>
+A uniform keep_k=32 baseline keeps 31 standard everywhere; CS instead keeps ~2× that in layers 0–1
+and ~¼ in the last layers — a loss-aware reallocation under a fixed total budget. Whether this
+<em>helps</em> downstream accuracy is the open question §9 is about.
+</p>
+
+<h2 id="pipeline"><span class="n">7</span>End-to-end pipeline</h2>
+<p>The full select → finetune → eval flow runs on this box. A CS <code>per_layer</code> smoke artifact
+finetuned cleanly (1 epoch, 70 steps) and evaluated through <code>launch_eval</code>:</p>
+<table>
+  <thead><tr><th>Run</th><th class="num">arc_challenge acc_uncond</th></tr></thead>
+  <tbody>
+    <tr><td>CS per_layer, keep_k=32 <em>(smoke: 16 cal / 50 steps / 1 epoch)</em></td><td class="num">0.348</td></tr>
+    <tr><td>uniform keep_k=32 (logged reference)</td><td class="num">0.545</td></tr>
+    <tr><td>random chance (4-choice)</td><td class="num">0.25</td></tr>
+  </tbody>
+</table>
+<div class="callout warn"><b>Not a method comparison.</b> The 0.348 confirms the pipeline is <em>correct and complete</em> — it does not say CS is good or bad. It used the throwaway smoke selection (near-arbitrary, see §5) and a 1-epoch finetune. A fair verdict needs a properly-sized run, which is §9.</div>
+
+<h2 id="env"><span class="n">8</span>Environment notes</h2>
+<ul>
+  <li><b>HF cache must live on <code>/workspace</code>.</b> Set <code>HF_HOME=/workspace/hf_cache</code> inline for every invocation — non-interactive bash doesn't source <code>.bashrc</code>, so the overlay disk fills otherwise. The selection scripts load with <code>device_map="auto"</code> (weights on GPU), so their saves stream GPU→CPU and stay light.</li>
+  <li><b><code>df</code> on <code>/workspace</code> is misleading.</b> It reports the underlying MFS cluster backing store (~378T), <em>not</em> the volume quota. A full volume makes large <code>save_pretrained</code> calls die <b>mid-write with exit 120 and no traceback</b> (it wrote shard 1, then ran out of space on shard 2) — which masquerades as an OOM. Check real usage with <code>du -sh /workspace/*</code>.</li>
+  <li><b>Eval needs <code>trust_remote_code</code> passed explicitly.</b> For a raw checkpoint path (not in the model library), pass it through <code>launch_eval --model-args '{"trust_remote_code": true}'</code>.</li>
+</ul>
+
+<h2 id="status"><span class="n">9</span>Status &amp; next steps</h2>
+<p><b>Done:</b> the method is implemented, committed, and verified across all three selection modes;
+the full pipeline (select → finetune → eval) works on a single H100.</p>
+<p><b>In progress <span class="tag wip">running</span>:</b> a <b>matched validation pair</b> — CS-<code>global</code> vs
+<code>easy_ep</code> at identical settings (keep_k=32, 1 shared, 256-example calibration, 3-epoch
+finetune, same eval) — to produce the first genuinely comparable arc_challenge numbers. <code>global</code>
+is the cell to watch, since it is the only mode that expresses the non-uniform allocation shown in §6.</p>
+<p><b>After that:</b> if a cell beats the baseline, a small grid (mode × &beta;-end × &lambda; in <code>threshold</code>)
+on arc_challenge, then scale to more tasks and keep_k values to trace the memory/accuracy Pareto
+frontier the method is meant to push out.</p>
+
+<footer>
+  Implementation reference for the EMO repo, <code>layerwise-shared-experts</code> branch.
+  Numbers are from single-H100 runs against <code>allenai/Emo_1b14b_1T</code> / <code>arc_challenge</code>;
+  the matched CS-vs-easy_ep comparison was still running when this was written and will be filled in
+  once complete.
+</footer>
+
+</div>
+</body>
+</html>
