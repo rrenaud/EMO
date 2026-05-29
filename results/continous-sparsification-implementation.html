@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Continuous Sparsification for EMO Expert Selection — Implementation Plan</title>
+<style>
+  :root{
+    --bg:#fafaf8; --fg:#1d1d1f; --muted:#5f5f6b; --rule:#e3e3dd;
+    --accent:#7b4fc4; --accent2:#1f7a6b; --code-bg:#f3f2ee; --code-fg:#2a2a34;
+    --warn-bg:#fff7e6; --warn-br:#e8c873; --good-bg:#eef7f0; --good-br:#8fc7a3;
+    --note-bg:#eef2fb; --note-br:#9fb4e0;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  .wrap{max-width:920px; margin:0 auto; padding:48px 28px 96px}
+  header.title{border-bottom:3px solid var(--accent); padding-bottom:18px; margin-bottom:8px}
+  header.title h1{font-size:30px; line-height:1.2; margin:0 0 6px}
+  header.title .sub{color:var(--muted); font-size:15px}
+  .meta{color:var(--muted); font-size:13px; margin:10px 0 34px}
+  h2{font-size:22px; margin:46px 0 12px; padding-top:8px; border-top:1px solid var(--rule)}
+  h2 .n{color:var(--accent); font-variant-numeric:tabular-nums; margin-right:10px}
+  h3{font-size:17px; margin:26px 0 8px; color:var(--accent2)}
+  p{margin:10px 0}
+  ul,ol{margin:10px 0 10px 4px; padding-left:22px}
+  li{margin:5px 0}
+  code{background:var(--code-bg); color:var(--code-fg); padding:1.5px 5px; border-radius:4px;
+    font:13.5px/1.5 "SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace}
+  .path{color:var(--accent2); white-space:nowrap}
+  pre{background:var(--code-bg); color:var(--code-fg); padding:16px 18px; border-radius:8px;
+    overflow:auto; border:1px solid var(--rule);
+    font:13px/1.55 "SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace}
+  pre code{background:none; padding:0}
+  .eq{background:#fff; border:1px solid var(--rule); border-left:4px solid var(--accent);
+    padding:12px 18px; margin:16px 0; border-radius:6px; font-size:17px; overflow-x:auto}
+  .eq .lbl{float:right; color:var(--muted); font-size:12px; font-style:italic}
+  .callout{padding:12px 16px; border-radius:8px; margin:16px 0; font-size:15px}
+  .note{background:var(--note-bg); border:1px solid var(--note-br)}
+  .warn{background:var(--warn-bg); border:1px solid var(--warn-br)}
+  .good{background:var(--good-bg); border:1px solid var(--good-br)}
+  .callout b{font-weight:650}
+  table{border-collapse:collapse; width:100%; margin:18px 0; font-size:14px}
+  th,td{border:1px solid var(--rule); padding:8px 11px; text-align:left; vertical-align:top}
+  th{background:#f0eef9; font-weight:650}
+  tbody tr:nth-child(even){background:#fff}
+  .toc{background:#fff; border:1px solid var(--rule); border-radius:8px; padding:14px 20px; margin:20px 0 8px}
+  .toc h4{margin:0 0 8px; font-size:13px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted)}
+  .toc ol{columns:2; column-gap:36px; margin:0; padding-left:20px; font-size:14px}
+  .toc a{color:var(--fg); text-decoration:none}
+  .toc a:hover{color:var(--accent); text-decoration:underline}
+  .tag{display:inline-block; font-size:11px; font-weight:650; letter-spacing:.04em;
+    padding:2px 8px; border-radius:20px; background:#efe9fb; color:var(--accent); margin-left:8px; vertical-align:middle}
+  .tag.ext{background:#eaf3f0; color:var(--accent2)}
+  var{font-style:italic; font-family:Georgia,"Times New Roman",serif}
+  sub,sup{font-size:.72em}
+  footer{margin-top:60px; padding-top:16px; border-top:1px solid var(--rule); color:var(--muted); font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="title">
+  <h1>Continuous Sparsification for EMO Expert Selection</h1>
+  <div class="sub">Implementation plan — a loss-aware, learned-mask alternative to layerwise / easy_ep / random expert pruning</div>
+</header>
+<div class="meta">Repo: <code>EMO</code> (ModMoE / OLMo-core fork) &middot; Method: Savarese, Silva &amp; Maire, &ldquo;Winning the Lottery with Continuous Sparsification,&rdquo; NeurIPS 2020 &middot; Status: design only (runs on cluster GPUs, not the dev box)</div>
+
+<div class="toc">
+  <h4>Contents</h4>
+  <ol>
+    <li><a href="#context">Context &amp; goal</a></li>
+    <li><a href="#algo">The CS algorithm</a></li>
+    <li><a href="#mapping">Mapping CS onto EMO experts</a></li>
+    <li><a href="#harden">Hardening &rarr; inference</a></li>
+    <li><a href="#tradeoffs">Tradeoffs</a></li>
+    <li><a href="#grounding">Grounding facts (file:line)</a></li>
+    <li><a href="#decisions">Decisions</a></li>
+    <li><a href="#impl">Implementation</a></li>
+    <li><a href="#orchestration">Orchestration</a></li>
+    <li><a href="#future">Future extension</a></li>
+    <li><a href="#verify">Verification</a></li>
+  </ol>
+</div>
+
+<h2 id="context"><span class="n">1</span>Context &amp; goal</h2>
+<p>
+EMO models can be pruned to a small task-specific subset of experts while keeping most of
+their accuracy. The repo already ships three selection methods, each of which emits a
+<em>structurally-pruned</em> model plus a <code>pruning_metadata.json</code>:
+</p>
+<ul>
+  <li><b>greedy layerwise</b> — <span class="path">src/hf_training/greedy_prune_layerwise.py</span> (and <code>_variable.py</code>)</li>
+  <li><b>easy_ep</b> (one-shot output-aware scoring) — <span class="path">src/hf_training/easy_ep_prune.py</span></li>
+  <li><b>random</b> baseline — <span class="path">src/hf_training/random_prune.py</span></li>
+</ul>
+<p>
+All three score experts cheaply (≈ one forward pass) and cut by frequency / importance.
+This plan adds a fourth method based on <b>Continuous Sparsification (CS)</b>. Instead of
+scoring from a passive forward pass, CS attaches a learnable logit to each routed expert,
+gates the expert by a soft mask, freezes all model weights, and runs a short calibration
+loop that trains only those mask logits (plus an L1 sparsity penalty) while annealing a
+temperature upward. The soft mask hardens toward a boolean decision, which is then
+<b>baked into a structural prune</b> via the existing in-place prune kernel — producing the
+exact same artifact the other methods produce, so it drops straight into the existing
+finetune / eval pipeline.
+</p>
+<div class="callout good"><b>Why bother:</b> selection becomes loss-aware and jointly optimized across experts and layers, rather than greedy or frequency-based — which may push out the memory / accuracy Pareto frontier.</div>
+
+<h2 id="algo"><span class="n">2</span>The CS algorithm (Savarese et al. 2020)</h2>
+<p>
+CS reframes pruning as continuous optimization. Every maskable unit <var>i</var> gets a
+learnable real-valued logit <var>s<sub>i</sub></var>. During training the unit is gated by
+a temperature-scaled sigmoid (a smooth relaxation of the Heaviside step):
+</p>
+<div class="eq"><span class="lbl">soft gate</span>
+&sigma;(&beta;&middot;<var>s<sub>i</sub></var>) = 1 / (1 + e<sup>&minus;&beta; <var>s<sub>i</sub></var></sup>)
+</div>
+<p>The objective adds an L1 penalty on the (soft) gates, encouraging them toward 0:</p>
+<div class="eq"><span class="lbl">objective</span>
+&#8466;(<var>w</var>, <var>s</var>) = &#8466;<sub>task</sub>( <var>w</var> &middot; &sigma;(&beta; <var>s</var>) ) + &lambda; &sum;<sub>i</sub> &sigma;(&beta; <var>s<sub>i</sub></var>)
+</div>
+<p>
+The temperature <var>&beta;</var> is <b>annealed from small (~1) to large (~100&ndash;200)</b>
+over training. As <var>&beta;</var>&nbsp;&rarr;&nbsp;&infin;, &sigma;(&beta; <var>s<sub>i</sub></var>)
+approaches the step function <var>H</var>(<var>s<sub>i</sub></var>) = 1 if <var>s<sub>i</sub></var>&nbsp;&gt;&nbsp;0
+else 0 &mdash; so the continuous gate <b>hardens into a binary mask</b>. At the end you take
+<var>H</var>(<var>s</var>) and bake it in.
+</p>
+
+<h2 id="mapping"><span class="n">3</span>Mapping CS onto EMO expert selection</h2>
+<p>
+We move the mask from individual weights to whole <b>routed experts</b>. A standard MoE layer
+output for token <var>x</var> is the gated sum over the top-k selected experts:
+</p>
+<div class="eq"><span class="lbl">baseline MoE</span>
+<var>y</var> = &sum;<sub><var>e</var> &isin; TopK</sub> <var>G</var>(<var>x</var>)<sub><var>e</var></sub> &middot; <var>E<sub>e</sub></var>(<var>x</var>)
+</div>
+<p>CS attaches a per-expert mask logit <var>s<sub>e</sub></var> and scales each selected expert's contribution:</p>
+<div class="eq"><span class="lbl">CS-gated MoE</span>
+<var>y</var> = &sum;<sub><var>e</var> &isin; TopK</sub> <var>G</var>(<var>x</var>)<sub><var>e</var></sub> &middot; &sigma;(&beta; <var>s<sub>e</sub></var>) &middot; <var>E<sub>e</sub></var>(<var>x</var>)
+</div>
+<p>
+The calibration phase freezes the experts <var>E<sub>e</sub></var> and the router, and trains
+<b>only</b> the <var>s<sub>e</sub></var> on a small task calibration set, with the L1 penalty
+sized by <var>&lambda;</var> to drive unimportant experts off. Shared (always-active) experts
+are <b>not</b> masked &mdash; their gate is fixed at 1, so they are never pruned.
+</p>
+
+<h2 id="harden"><span class="n">4</span>Hardening &rarr; how it's used at inference</h2>
+<p>
+Yes &mdash; the optimization hardens into a boolean mask, but with one important nuance:
+<b>we do not carry the mask (a per-expert multiply) into inference.</b> We compile the
+boolean decision into <b>structural pruning</b> &mdash; experts with mask&nbsp;0 have their
+MLP weights and gate rows physically removed via <code>prune_moe_layer_inplace</code>. So the
+deployed model is a genuinely smaller MoE, byte-identical in form to what layerwise/easy_ep
+produce, with <b>zero inference overhead</b>. The mask is a training-time scaffold, not a
+runtime artifact.
+</p>
+<div class="callout note">There are two ways to turn the learned masks into the final cut (see <a href="#tradeoffs">tradeoff #1</a>): the <b>pure CS threshold</b> (keep <var>s<sub>e</sub></var>&nbsp;&ge;&nbsp;0, emergent count) or <b>CS-as-scorer</b> (use <var>s<sub>e</sub></var> as an importance score and take top-k to hit an exact budget). Both end in a physically pruned model; we support both behind a flag.</div>
+
+<h2 id="tradeoffs"><span class="n">5</span>Tradeoffs</h2>
+<table>
+  <thead><tr><th>#</th><th>Tradeoff</th><th>What it means here</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>1</td><td><b>Exact budget vs. emergent count</b></td>
+      <td>Pure CS doesn't let you dial &ldquo;keep exactly 32.&rdquo; The penalty <var>&lambda;</var> trades task loss against survivor count, which is <em>emergent</em> &mdash; you'd tune <var>&lambda;</var> across runs to land on a target. The escape hatch is to treat <var>s<sub>e</sub></var> as an importance score and take top-k (exact budget) &mdash; trading CS's self-determined sparsity for clean integration with the existing keep_k pipeline. <b>This is the central tension.</b></td>
+    </tr>
+    <tr>
+      <td>2</td><td><b>Train-soft / infer-hard rounding gap</b></td>
+      <td>Mid-training an expert can contribute a partial 0.4&times; output; at inference you round to {0,1}. If <var>&beta;</var> isn't annealed high enough, the soft model the optimizer tuned diverges from the hard model you deploy. Annealing <var>&beta;</var> high closes the gap &mdash; but too fast/high too early saturates the sigmoid, gradients vanish, and masks freeze at init. The <var>&beta;</var>-schedule is a real, sensitive hyperparameter (the one-shot methods have none).</td>
+    </tr>
+    <tr>
+      <td>3</td><td><b>Cost</b></td>
+      <td>Layerwise/easy_ep are ≈ one forward pass &mdash; effectively instant. CS needs a real optimization loop (forward+backward over calibration data with <var>&beta;</var>/<var>&lambda;</var> schedules). The payoff is a potentially better Pareto frontier from loss-aware, joint selection.</td>
+    </tr>
+    <tr>
+      <td>4</td><td><b>Top-k limits the gradient</b></td>
+      <td>In the faithful output-scaling variant an expert's mask only gets a task gradient when it's in some token's top-k; the penalty alone pushes the rest off. The mask can't observe how <em>dropping</em> a selected expert would reroute tokens (top-k membership is fixed). The <a href="#future">routing-aware variant</a> addresses this at the cost of complexity.</td>
+    </tr>
+    <tr>
+      <td>5</td><td><b>This pipeline is forgiving</b></td>
+      <td>After hardening + physical prune, the existing flow finetunes the survivors (<span class="path">finetune.py</span>). A small rounding gap gets recovered downstream &mdash; CS is more forgiving here than in a prune-and-freeze setting.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="grounding"><span class="n">6</span>Grounding facts (already verified)</h2>
+<ul>
+  <li><b>MoE forward</b> lives in <span class="path">src/hf_trust_remote_code/emo/modeling_emo.py</span>, <code>EmoSparseMoeBlock.forward</code> (lines&nbsp;318&ndash;409). After computing <code>routing_weights</code> <code>(B*T, top_k)</code> and <code>selected_experts</code> <code>(B*T, top_k)</code>, it loops experts: <code>expert_layer(state) * routing_weights[top_x, idx, None]</code> then <code>index_add_</code>. With shared experts a two-path softmax is used: standard experts occupy indices <code>[0, num_experts&minus;num_shared)</code>, shared occupy the trailing <code>num_shared</code> (their <code>selected_experts</code> are offset by <code>num_experts&minus;num_shared</code>).</li>
+  <li><b>Loading is via <code>trust_remote_code</code>.</b> The in-repo <code>modeling_emo.py</code> is the <em>source</em> uploaded to the hub (<span class="path">src/hf_trust_remote_code/upload_to_hf.py</span> patches <code>auto_map</code>); the class actually executed for a checkpoint is the bundled hub copy. <b>&rArr; Inject the mask by runtime monkeypatching of loaded block instances, not by editing <code>modeling_emo.py</code>.</b></li>
+  <li><b>Structural prune kernel:</b> <code>prune_moe_layer_inplace(layer, experts_to_keep, prune_keep_k, target_num_shared_experts)</code> &mdash; <span class="path">src/hf_training/greedy_prune_layerwise.py:51</span>. Rebuilds <code>moe.experts</code>, slices <code>moe.gate.weight</code>/<code>bias</code>, updates <code>num_experts</code>/<code>num_shared_experts</code>/<code>top_k</code>. Reused by every method.</li>
+  <li><b>Save + metadata convention:</b> <span class="path">greedy_prune_layerwise_variable.py:274&ndash;327</span> &mdash; writes <code>experts_kept_per_layer</code>, <code>keep_k_per_layer</code>, <code>num_experts_per_layer</code>, <code>num_shared_experts_per_layer</code>, <code>output_router_logits=True</code>, <code>pruning_method</code>, then <code>model.save_pretrained</code>.</li>
+  <li><b>Calibration data with masked labels</b> (needed for a loss): reuse <code>load_finetuning_dataset(task, split, tokenizer, max_length, num_shots_override)</code> + <code>MaskedLossDataCollator</code> from <span class="path">finetune.py</span> / <span class="path">data_utils.py</span>. (The other prune scripts use <code>get_formatted_prompts</code>, which returns prompts without labels &mdash; not enough for CS.)</li>
+  <li><b>Freeze pattern to mirror:</b> <code>apply_freeze_mode</code> (<span class="path">finetune.py:130</span>) sets <code>param.requires_grad</code>.</li>
+</ul>
+
+<h2 id="decisions"><span class="n">7</span>Decisions (confirmed)</h2>
+<ul>
+  <li><b>Selection mode:</b> <code>--selection-mode {per_layer, global, threshold}</code> &mdash; all three.</li>
+  <li><b>Mask injection:</b> faithful <b>output-scaling</b> (multiply selected experts' routing weight by &sigma;(&beta; <var>s<sub>e</sub></var>) after top-k) is the shipped path; routing-aware score-masking documented as a future extension only.</li>
+  <li><b>Orchestration:</b> standalone pruning script (emits pruned model + metadata); an optional <code>hf_finetune_with_selective_continuous.sh</code> wrapper is sketched, not required.</li>
+</ul>
+
+<h2 id="impl"><span class="n">8</span>Implementation</h2>
+<h3>New file: <span class="path">src/hf_training/continuous_sparsify_prune.py</span></h3>
+<p>Mirror the CLI / structure of <code>greedy_prune_layerwise_variable.py</code>. Reuse its imports, <code>prune_moe_layer_inplace</code>, <code>_is_moe_layer</code>, and the save/metadata block where possible.</p>
+
+<h3>(a) Mask attachment + monkeypatch</h3>
+<p>
+Walk <code>model.model.layers</code>; for each MoE layer register a trainable
+<code>nn.Parameter cs_mask_logits</code> of shape <code>(num_standard,)</code> where
+<code>num_standard = num_experts &minus; num_shared_experts</code>, init to a small positive
+constant <code>s_init</code> (so &sigma;(&beta;<sub>0</sub>&middot;s_init)&nbsp;&approx;&nbsp;1 &mdash; all
+experts start fully on). Store a mutable <code>cs_beta</code> (python float, updated per step)
+on the block. Replace each block's <code>.forward</code> with a bound method
+(<code>types.MethodType</code>) that reimplements the known forward with one change &mdash; right
+after <code>routing_weights</code> / <code>selected_experts</code> are computed and before the
+expert loop:
+</p>
+<pre><code>full_mask = torch.cat([
+    torch.sigmoid(self.cs_beta * self.cs_mask_logits),                    # standard experts
+    torch.ones(self.num_shared_experts, device=dev, dtype=torch.float),   # shared: fixed at 1
+])                                                                        # -> (num_experts,)
+routing_weights = routing_weights * full_mask[selected_experts].to(routing_weights.dtype)</code></pre>
+<p>
+The no-shared path simply has <code>full_mask = &sigma;(&beta; s)</code> over all experts. Shared
+positions are gathered at 1 so they are never pruned. The patched forward must preserve the
+<code>(final_hidden_states, router_logits)</code> return tuple and the
+<code>always_active_experts</code> / <code>norm_topk_prob</code> branches. Keep a handle to restore
+the original forward after calibration.
+</p>
+
+<h3>(b) Freeze + optimizer</h3>
+<pre><code>for p in model.parameters(): p.requires_grad_(False)
+mask_params = [blk.cs_mask_logits for blk in moe_blocks]
+for m in mask_params: m.requires_grad_(True)
+opt = torch.optim.Adam(mask_params, lr=args.lr)</code></pre>
+
+<h3>(c) Calibration loop (manual, single-process)</h3>
+<p>
+Build a <code>DataLoader</code> from <code>load_finetuning_dataset(...)</code> +
+<code>MaskedLossDataCollator</code>. Subsample with <code>--num-calibration</code> +
+<code>--prune-seed</code> (mirror the seeded <code>torch.randperm</code> subsampling in
+<span class="path">greedy_prune_layerwise.py</span>). Per step:
+</p>
+<ol>
+  <li>Forward <code>model(input_ids, attention_mask=...)</code>; compute <b>CE manually</b> from <code>logits</code> + shifted <code>labels</code> (<code>ignore_index=&minus;100</code>) &mdash; avoids contaminating the loss with the model's router aux loss.</li>
+  <li><code>penalty = &lambda; &middot; &sum;<sub>layers</sub> &sum;<sub>e</sub> &sigma;(&beta; s<sub>e</sub>)</code> computed directly from the params (so even never-selected experts get pushed off).</li>
+  <li><code>loss = ce + penalty</code>; backward; <code>clip_grad_norm_</code>; <code>opt.step()</code>.</li>
+  <li>Update <code>&beta;</code> on every block via an <b>exponential schedule</b> from <code>--beta-start</code> to <code>--beta-end</code> across the planned step count.</li>
+  <li>Log: mean mask, fraction of <code>s<sub>e</sub>&ge;0</code>, ce, penalty.</li>
+</ol>
+
+<h3>(d) Selection &rarr; keep-set</h3>
+<p>After the loop, read per-layer <code>s<sub>e</sub></code>. Final score = <code>s<sub>e</sub></code> (monotonic in &sigma;). Build <code>experts_kept_per_layer</code>, always appending the <code>num_shared</code> trailing shared indices (as the other methods do):</p>
+<ul>
+  <li><b><code>per_layer</code></b>: top <code>(keep_k &minus; num_shared)</code> standard experts each layer &rarr; uniform keep_k.</li>
+  <li><b><code>global</code></b>: rank all standard experts across MoE layers; keep total <code>(keep_k &minus; num_shared) &times; num_moe_layers</code>; per-layer counts vary (use the variable save path &rarr; <code>keep_k_per_layer</code>).</li>
+  <li><b><code>threshold</code></b>: keep standard experts with <code>s<sub>e</sub>&nbsp;&ge;&nbsp;0</code> (emergent count, pure CS). Log resulting per-layer counts since they aren't budget-controlled.</li>
+</ul>
+
+<h3>(e) Bake + save</h3>
+<p>
+Restore the original forward, then for each layer call
+<code>prune_moe_layer_inplace(layer, experts_to_keep, layer_keep_k, target_shared)</code>. Reuse
+the config-update + <code>save_pretrained</code> + <code>pruning_metadata.json</code> block from
+<span class="path">greedy_prune_layerwise_variable.py:274&ndash;327</span>, with
+<code>pruning_method="continuous_sparsification"</code> plus CS hyperparams
+(<code>lambda</code>, <code>beta_start/end</code>, <code>lr</code>, <code>num_steps</code>,
+<code>selection_mode</code>, <code>s_init</code>) and
+<code>experts_kept_per_layer</code> / <code>keep_k_per_layer</code>. Run the same before/after
+hidden-state sanity check used at <span class="path">greedy_prune_layerwise_variable.py:251&ndash;272</span>.
+</p>
+
+<h3>CLI args</h3>
+<p>
+Match existing: <code>--model --task --split --prune-keep-k --num-shared-experts --save-path
+--batch-size --num-calibration --num-shots-override --prune-seed --trust-remote-code</code>.
+Add CS-specific: <code>--selection-mode --lambda --lr --num-steps</code> (or
+<code>--num-epochs</code>) <code>--beta-start --beta-end --s-init --max-seq-length --grad-clip</code>.
+</p>
+
+<h2 id="orchestration"><span class="n">9</span>Orchestration (optional)</h2>
+<p>
+New file <span class="path">scripts/selective_hf/hf_finetune_with_selective_continuous.sh</span>:
+copy <code>hf_finetune_with_selective_easy_ep.sh</code> and swap the selection step
+(<code>python -m src.hf_training.easy_ep_prune ...</code>, ≈ line 204) for
+<code>python -m src.hf_training.continuous_sparsify_prune ...</code> with the CS flags,
+forwarding <code>--prune-keep-k</code>, <code>--num-shared-experts</code>, <code>--save-path</code>.
+The finetune (<span class="path">finetune.py</span>) and eval (<code>launch_eval</code>) tail is
+unchanged because the artifact format is identical. Adding a <code>"continuous"</code> mode to
+<span class="path">launch_selective_method_hf.sh</span> is documented but not required.
+</p>
+
+<h2 id="future"><span class="n">10</span>Future extension <span class="tag ext">not built</span></h2>
+<p>
+<b>Routing-aware variant.</b> Subtract an annealed
+<code>&minus;&gamma;&middot;(1&minus;&sigma;(&beta; s<sub>e</sub>))</code> term from <code>router_logits</code>
+before top-k, so suppressed experts drop out of the top-k and tokens reroute to survivors
+<em>during</em> calibration &mdash; closer to the deployed pruned model and a fuller realization
+of CS's &ldquo;co-optimization&rdquo; claim, at the cost of harder annealing and binarization.
+</p>
+
+<h2 id="verify"><span class="n">11</span>Verification (on a GPU box)</h2>
+<ol>
+  <li><b>Smoke:</b> small EMO checkpoint, <code>--task arc_challenge --num-calibration 16 --num-steps 50 --prune-keep-k 32 --num-shared-experts 1 --selection-mode per_layer</code>. Confirm loss decreases, penalty falls, and the before/after sanity check passes.</li>
+  <li><b>Artifact parity:</b> confirm <code>save_path/</code> loads via <code>AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)</code> and that <code>pruning_metadata.json</code> has <code>experts_kept_per_layer</code> with correct per-layer lengths per mode (<code>per_layer</code> uniform; <code>global</code>/<code>threshold</code> variable). Diff schema against an easy_ep run.</li>
+  <li><b>Mask sanity:</b> masks start ≈ 1 (&sigma;(&beta;<sub>0</sub>&middot;s_init)); surviving experts' <code>s<sub>e</sub></code> are the largest; <code>threshold</code> count matches <code>#(s<sub>e</sub>&ge;0)</code>.</li>
+  <li><b>Forward-patch correctness:</b> with <code>&lambda;=0</code> and <code>&beta;</code> fixed small, the patched forward ≈ matches the unpatched model (masks ≈ 1 &rarr; near-identity) within tolerance; after restoring forward, output equals the original exactly.</li>
+  <li><b>End-to-end:</b> run the optional wrapper for one <code>(model, task, keep_k)</code>; confirm finetune + eval complete and produce metrics comparable to the easy_ep baseline.</li>
+</ol>
+
+<footer>
+  Generated as an implementation reference for the EMO repo. Code paths and line numbers are
+  from the <code>layerwise-shared-experts</code> branch and may drift; re-verify against the
+  current tree before implementing.
+</footer>
+
+</div>
+</body>
+</html>
