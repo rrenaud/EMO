@@ -207,15 +207,16 @@ def easy_ep_prune(
     calibration batch, pick top-k per layer, save pruned model.
     """
     logger.info(f"Loading model: {model_name}")
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=config,
         torch_dtype=torch.bfloat16,
         device_map="auto" if device is None else device,
+        trust_remote_code=True,
     )
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
