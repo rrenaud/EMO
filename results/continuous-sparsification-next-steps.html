@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Continuous Sparsification for EMO — Findings &amp; Next Steps</title>
+<style>
+  :root{
+    --bg:#fafaf8; --fg:#1d1d1f; --muted:#5f5f6b; --rule:#e3e3dd;
+    --accent:#7b4fc4; --accent2:#1f7a6b; --code-bg:#f3f2ee; --code-fg:#2a2a34;
+    --warn-bg:#fff7e6; --warn-br:#e8c873; --good-bg:#eef7f0; --good-br:#8fc7a3;
+    --note-bg:#eef2fb; --note-br:#9fb4e0; --bad-bg:#fceeee; --bad-br:#d99;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:920px; margin:0 auto; padding:48px 28px 96px}
+  header.title{border-bottom:3px solid var(--accent); padding-bottom:18px; margin-bottom:8px}
+  header.title h1{font-size:30px; line-height:1.2; margin:0 0 6px}
+  header.title .sub{color:var(--muted); font-size:15px}
+  .meta{color:var(--muted); font-size:13px; margin:10px 0 34px}
+  h2{font-size:22px; margin:46px 0 12px; padding-top:8px; border-top:1px solid var(--rule)}
+  h2 .n{color:var(--accent); font-variant-numeric:tabular-nums; margin-right:10px}
+  h3{font-size:17px; margin:26px 0 8px; color:var(--accent2)}
+  p{margin:10px 0}
+  ul,ol{margin:10px 0 10px 4px; padding-left:22px}
+  li{margin:6px 0}
+  code{background:var(--code-bg); color:var(--code-fg); padding:1.5px 5px; border-radius:4px;
+    font:13.5px/1.5 "SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace}
+  .path{color:var(--accent2); white-space:nowrap}
+  pre{background:var(--code-bg); color:var(--code-fg); padding:16px 18px; border-radius:8px;
+    overflow:auto; border:1px solid var(--rule);
+    font:13px/1.55 "SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace}
+  pre code{background:none; padding:0}
+  .eq{background:#fff; border:1px solid var(--rule); border-left:4px solid var(--accent);
+    padding:12px 18px; margin:16px 0; border-radius:6px; font-size:17px; overflow-x:auto}
+  .callout{padding:12px 16px; border-radius:8px; margin:16px 0; font-size:15px}
+  .note{background:var(--note-bg); border:1px solid var(--note-br)}
+  .warn{background:var(--warn-bg); border:1px solid var(--warn-br)}
+  .good{background:var(--good-bg); border:1px solid var(--good-br)}
+  .bad{background:var(--bad-bg); border:1px solid var(--bad-br)}
+  .callout b{font-weight:650}
+  table{border-collapse:collapse; width:100%; margin:18px 0; font-size:14px}
+  th,td{border:1px solid var(--rule); padding:8px 11px; text-align:left; vertical-align:top}
+  th{background:#f0eef9; font-weight:650}
+  tbody tr:nth-child(even){background:#fff}
+  td.num,th.num{text-align:right; font-variant-numeric:tabular-nums}
+  .toc{background:#fff; border:1px solid var(--rule); border-radius:8px; padding:14px 20px; margin:20px 0 8px}
+  .toc h4{margin:0 0 8px; font-size:13px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted)}
+  .toc ol{columns:2; column-gap:36px; margin:0; padding-left:20px; font-size:14px}
+  .toc a{color:var(--fg); text-decoration:none}
+  .toc a:hover{color:var(--accent); text-decoration:underline}
+  .pri{display:inline-block; font-size:11px; font-weight:700; letter-spacing:.04em; padding:2px 8px;
+    border-radius:20px; margin-right:8px; vertical-align:middle}
+  .p1{background:#e7dcfb; color:#5a3aa0} .p2{background:#dceaf0; color:#1f6f7a} .p3{background:#eee; color:#666}
+  var{font-style:italic; font-family:Georgia,"Times New Roman",serif}
+  sub,sup{font-size:.72em}
+  footer{margin-top:60px; padding-top:16px; border-top:1px solid var(--rule); color:var(--muted); font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="title">
+  <h1>Continuous Sparsification — Findings &amp; Next Steps</h1>
+  <div class="sub">Where the experiments landed, why, and what to try next</div>
+</header>
+<div class="meta">
+  Repo: <code>EMO</code> · Branch: <code>layerwise-shared-experts</code> ·
+  Companions: <span class="path">results/continous-sparsification-implementation.html</span> (design),
+  <span class="path">results/continuous-sparsification-implementation-notes.html</span> (as-built + verification).
+  All numbers: single H100, <code>allenai/Emo_1b14b_1T</code>, <code>arc_challenge</code>, keep_k=32, 1 shared.
+</div>
+
+<div class="toc">
+  <h4>Contents</h4>
+  <ol>
+    <li><a href="#tldr">TL;DR</a></li>
+    <li><a href="#results">Results so far</a></li>
+    <li><a href="#nobug">Is there a bug? (no)</a></li>
+    <li><a href="#why">Why CS underperforms</a></li>
+    <li><a href="#next">Next steps (prioritized)</a></li>
+    <li><a href="#method">Eval methodology notes</a></li>
+    <li><a href="#repro">How to reproduce</a></li>
+  </ol>
+</div>
+
+<h2 id="tldr"><span class="n">1</span>TL;DR</h2>
+<p>
+The CS method is fully implemented, verified, and parity-checked. In a <b>matched comparison</b> it
+<b>underperforms <code>easy_ep</code></b> on arc_challenge (CS-global 0.334 vs easy_ep 0.535, finetuned).
+A dedicated diagnostic <b>rules out an implementation bug</b>: the mask logits train healthily (large
+spread, non-degenerate selection, correct sign). CS is simply a <em>weaker selector</em> than easy_ep at
+these settings — most plausibly because the shipped <b>output-scaling</b> variant is blind to how pruning
+reroutes tokens. The highest-value next experiment is the <b>routing-aware variant</b>, which targets
+exactly that gap.
+</p>
+
+<h2 id="results"><span class="n">2</span>Results so far</h2>
+<table>
+  <thead><tr><th>Method / config</th><th>finetune</th><th class="num">arc_challenge acc_uncond</th></tr></thead>
+  <tbody>
+    <tr><td>uniform keep_k=32 (reference)</td><td>no</td><td class="num">0.545</td></tr>
+    <tr><td><b>easy_ep</b></td><td>3-epoch</td><td class="num">0.535</td></tr>
+    <tr><td><b>easy_ep</b></td><td>none</td><td class="num">0.465</td></tr>
+    <tr><td><b>CS per_layer</b> (200 steps, lr 0.1, &beta;&rarr;200)</td><td>none</td><td class="num">0.341</td></tr>
+    <tr><td><b>CS global</b> (256 cal, 200 steps, lr 0.1, &beta;&rarr;200)</td><td>3-epoch</td><td class="num">0.334</td></tr>
+    <tr><td>random chance (4-choice)</td><td>—</td><td class="num">0.25</td></tr>
+  </tbody>
+</table>
+<div class="callout bad"><b>Negative result.</b> Both CS modes land far below easy_ep. Crucially, <code>per_layer</code>
+uses the <em>same uniform budget</em> as easy_ep (31 standard + 1 shared per layer), so this isn't just
+<code>global</code>'s aggressive late-layer allocation — CS's <b>selection itself</b> is worse here.</div>
+
+<h2 id="nobug"><span class="n">3</span>Is there a bug? (No — verified)</h2>
+<p>
+The poor result prompted a sanity-check diagnostic (<span class="path">cs_diagnostic.py</span>): load the
+model, run CS calibration, and inspect what the masks actually learned. It rules out the three failure
+modes that would have indicated a defect.
+</p>
+<table>
+  <thead><tr><th>Check</th><th>Expectation if buggy</th><th>Observed</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td><b>Logit movement</b></td><td>std ≈ 0 (frozen / saturated)</td><td>mean std ≈ <b>2.63</b>, moved ~2.4 from init</td><td>masks train</td></tr>
+    <tr><td><b>Degeneracy</b></td><td>kept set == <code>[0..30]</code> every layer (top-k over ties)</td><td><b>0 / 16</b> layers degenerate</td><td>data-driven</td></tr>
+    <tr><td><b>Sign / direction</b></td><td>freq-overlap <em>below</em> chance (~0.12)</td><td>overlap <b>0.36</b> &gt; chance 0.24</td><td>correct sign</td></tr>
+    <tr><td><b>Mask gradient (parity test)</b></td><td>—</td><td>flows to 70/127 experts; hook ≡ old forward to 1e-6</td><td>wired right</td></tr>
+  </tbody>
+</table>
+<p>
+So the masks move a lot, the selection is non-degenerate, and we keep the experts the optimizer wants
+<em>on</em> (above-chance overlap with the router-frequency ranking; an inverted sign would be below chance).
+A &ldquo;responsive&rdquo; config (<code>s_init=0</code>, &beta;&rarr;15, 300 steps) increases frequency overlap to 0.42
+and is more decisive (fewer experts above threshold), but does not find a <em>better</em> set — just a
+slightly more frequency-aligned one. <b>Conclusion: the code is correct; CS is genuinely the weaker
+selector at these settings.</b>
+</p>
+
+<h2 id="why"><span class="n">4</span>Why CS underperforms</h2>
+<ol>
+  <li><b>The shipped variant is blind to rerouting (primary suspect).</b> The faithful
+  <em>output-scaling</em> variant multiplies each selected expert's contribution by &sigma;(&beta; <var>s<sub>e</sub></var>)
+  but leaves top-k routing unchanged. So <var>s<sub>e</sub></var> learns &ldquo;how much does down-scaling expert
+  <var>e</var> hurt loss <em>while every other expert still fires as usual</em>&rdquo; — it never observes that, after
+  pruning, tokens <b>reroute</b> onto the survivors. easy_ep scores at the same full-model operating point but
+  its hand-designed output-aware importance evidently transfers better to the pruned model.</li>
+  <li><b>The learned signal is only mildly importance-aligned.</b> Frequency overlap of 0.36–0.42 (vs 0.24
+  chance) means CS keeps a substantially different set than the high-traffic experts — and that different
+  set is worse for accuracy, not better.</li>
+  <li><b><code>global</code> compounds it.</b> Ranking <var>s<sub>e</sub></var> <em>across</em> layers (logits that may not be
+  comparable layer-to-layer) spent the budget gutting late layers to 7–8 experts, which is additionally
+  harmful on top of the weaker base selection.</li>
+</ol>
+
+<h2 id="next"><span class="n">5</span>Next steps (prioritized)</h2>
+
+<h3><span class="pri p1">P1</span>Routing-aware variant</h3>
+<p>
+The most principled fix and the one CS theory says should matter. Before top-k, subtract an annealed
+penalty from the router logits so suppressed experts actually fall out of the top-k and tokens reroute
+onto survivors <em>during</em> calibration:
+</p>
+<div class="eq">router_logits&prime; = router_logits &minus; &gamma;&middot;(1 &minus; &sigma;(&beta; <var>s<sub>e</sub></var>))</div>
+<ul>
+  <li>Directly attacks reason #1 — the calibration operating point now matches the deployed pruned model.</li>
+  <li>Implementation: a second forward hook on <code>gate</code> (or a thin gate wrapper) that adjusts logits
+  pre-softmax; the per-expert output hooks can stay or be removed. Harder annealing (&gamma;, &beta; schedules)
+  is the cost; binarization is touchier.</li>
+  <li><b>Decision gate:</b> if routing-aware CS still doesn't reach easy_ep, the formulation — not the
+  implementation — is the ceiling for this model/task, and CS should be shelved for EMO pruning.</li>
+</ul>
+
+<h3><span class="pri p2">P2</span>Finish the hyperparameter sweep</h3>
+<p>
+A select→eval (no-finetune) sweep is wired up in <span class="path">run_cs_sweep.sh</span> (paused; completed
+cells cached, auto-skipped on resume). Remaining cells — <code>per_layer</code> with steps=500, lr=0.3, and
+&beta;&rarr;50 (the &ldquo;responsive&rdquo; regime that aligns better with frequency) — quantify whether better
+mask optimization lifts accuracy. If they all stay ≈ 0.34–0.40, that is strong evidence the output-scaling
+formulation itself is the ceiling (and motivates P1 over more tuning).
+</p>
+
+<h3><span class="pri p3">P3</span>Cheaper / secondary ideas</h3>
+<ul>
+  <li><b>More / longer calibration:</b> the responsive config improved frequency alignment; more data + steps may help, but is unlikely to overcome the rerouting blind spot.</li>
+  <li><b>Constrain <code>global</code> allocation:</b> normalize <var>s<sub>e</sub></var> within each layer before the global
+  ranking, or impose a per-layer floor, so it can't gut late layers. Only worth it if the base selection
+  becomes competitive.</li>
+  <li><b><code>threshold</code> / Pareto study:</b> CS's natural mode is emergent count; sweeping &lambda; traces a
+  memory↔accuracy curve at variable keep_k (not iso-budget), a different comparison than the iso-32 runs here.</li>
+</ul>
+
+<h2 id="method"><span class="n">6</span>Eval methodology notes</h2>
+<ul>
+  <li><b>Finetune adds ~0.07 here</b> (easy_ep: 0.465 → 0.535). So absolute numbers shift with finetuning,
+  but <b>relative selection quality is preserved</b> — the no-finetune sweep is a valid, ~2× cheaper way to
+  rank selectors; finetune only the winner for the headline number.</li>
+  <li><b><code>trust_remote_code</code> must be passed explicitly</b> to <code>launch_eval</code> for raw checkpoint
+  paths: <code>--model-args '{"trust_remote_code": true}'</code>.</li>
+  <li><b>Disk:</b> <code>df /workspace</code> shows the MFS backing store, not the volume quota; a full volume
+  makes <code>save_pretrained</code> die mid-write (exit 120, looks like OOM). Use <code>du</code>. Each pruned model
+  is ~7.8 GB — delete intermediates between sweep cells.</li>
+</ul>
+
+<h2 id="repro"><span class="n">7</span>How to reproduce</h2>
+<pre><code># Diagnostic (logit movement, degeneracy, sign/overlap):
+PYTHONPATH=/workspace/EMO:/workspace/EMO/src HF_HOME=/workspace/hf_cache \
+  python /workspace/cs_diagnostic.py
+
+# Selection-only sweep (resumable; skips cached cells):
+bash /workspace/run_cs_sweep.sh
+
+# Matched select->finetune->eval pair (CS-global vs easy_ep):
+bash /workspace/run_val_pair.sh   # (regenerate if cleaned)</code></pre>
+
+<footer>
+  Findings as of the <code>layerwise-shared-experts</code> branch. The implementation is verified correct;
+  the open question is whether the <em>routing-aware</em> CS variant can close the gap to easy_ep, or whether
+  the output-scaling formulation is fundamentally the wrong fit for EMO expert pruning on this task.
+</footer>
+
+</div>
+</body>
+</html>
