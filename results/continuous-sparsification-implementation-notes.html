@@ -113,7 +113,7 @@ finetune / eval pipeline with <b>zero inference overhead</b>.</p>
   <thead><tr><th>File</th><th>Status</th><th>What</th></tr></thead>
   <tbody>
     <tr><td><span class="path">src/hf_training/continuous_sparsify_prune.py</span></td><td><span class="tag ok">new</span></td>
-      <td>Standalone CS pruning script (~510 lines). Mirrors the CLI/structure of the sibling prune scripts and reuses <code>prune_moe_layer_inplace</code>, <code>_is_moe_layer</code>, <code>_capture_layer_output</code>.</td></tr>
+      <td>Standalone CS pruning script. Mirrors the CLI/structure of the sibling prune scripts and reuses <code>prune_moe_layer_inplace</code>, <code>_is_moe_layer</code>, <code>_capture_layer_output</code>. Mask injection is via per-expert forward hooks (§2a).</td></tr>
     <tr><td><span class="path">scripts/selective_hf/hf_finetune_with_selective_continuous.sh</span></td><td><span class="tag ok">new</span></td>
       <td>Orchestration wrapper: select → finetune → eval, copied from the easy_ep wrapper with the selection step swapped and CS flags forwarded.</td></tr>
     <tr><td><span class="path">src/hf_training/easy_ep_prune.py</span></td><td><span class="tag wip">1-line fix</span></td>
@@ -132,21 +132,30 @@ contribution is gated by a temperature-scaled sigmoid; the loss adds an L1 penal
 <p>As <var>&beta;</var> is annealed upward (1 → 200), &sigma;(&beta; <var>s<sub>e</sub></var>) hardens toward the step function
 <var>H</var>(<var>s<sub>e</sub></var>), so the keep/drop decision becomes &ldquo;<var>s<sub>e</sub></var> ≥ 0&rdquo;.</p>
 
-<h3>(a) Mask attachment by runtime monkeypatch</h3>
+<h3>(a) Mask attachment by per-expert output hooks</h3>
 <p>
 The class that actually executes for a checkpoint is the <b>hub copy</b> of <code>modeling_emo.py</code>
-(loaded via <code>trust_remote_code</code>), not the in-repo source — so the mask is injected by
-<b>monkeypatching loaded block instances</b>, never by editing <code>modeling_emo.py</code>. For each MoE
-layer we register a trainable <code>nn.Parameter cs_mask_logits</code> of shape <code>(num_standard,)</code>
-(init <code>s_init=3.0</code> ⇒ all gates start ≈ 1), store a mutable python float <code>cs_beta</code>, and replace
-<code>.forward</code> with a bound method that re-implements the known forward with one change right
-before the expert loop:
+(loaded via <code>trust_remote_code</code>), not the in-repo source — so the mask must be injected on
+loaded block instances, never by editing <code>modeling_emo.py</code>. The clean way to do that uses one
+observation: the block sums each expert's contribution as <code>expert(x) · routing_weight</code>, so
+<b>scaling expert <var>e</var>'s output by &sigma;(&beta; <var>s<sub>e</sub></var>) is identical to scaling its routing
+weight</b> — <code>mask<sub>e</sub>·expert(x)·rw ≡ expert(x)·(mask<sub>e</sub>·rw)</code>. We therefore attach a
+<code>register_forward_hook</code> to each <em>standard</em> expert and leave the block's own forward
+<b>completely untouched</b> (nothing to keep in sync with the hub copy):
 </p>
-<pre><code>mask_std = torch.sigmoid(self.cs_beta * self.cs_mask_logits)        # (num_standard,) float
-full_mask = torch.cat([mask_std, torch.ones(self.num_shared_experts)])  # shared fixed at 1
-routing_weights = routing_weights * full_mask[selected_experts]    # in float, BEFORE the bf16 cast</code></pre>
-<p>Shared (trailing) experts are gathered at a fixed gate of 1, so they are never pruned. A handle to
-the original forward is kept so it can be restored before saving.</p>
+<pre><code># per MoE layer: a trainable mask logit per standard expert (init s_init=3.0 -> gate ~1),
+# plus a mutable python float cs_beta updated each calibration step.
+moe.cs_mask_logits = nn.Parameter(torch.full((num_standard,), s_init))
+moe.cs_beta = beta_start
+
+def hook(_module, _inputs, output, e=e, blk=moe):       # one hook per standard expert
+    return output * torch.sigmoid(blk.cs_beta * blk.cs_mask_logits[e])
+moe.experts[e].register_forward_hook(hook)</code></pre>
+<p>Shared (trailing) experts are simply left unhooked, so their gate stays fixed at 1 and they are
+never pruned; teardown before saving is just <code>handle.remove()</code> on each hook. An earlier version
+instead monkeypatched a re-implemented <code>forward</code> onto each block; the hook version was verified
+to be <b>numerically identical</b> (output and mask-gradient parity to float32 round-off — see §5) while
+copying none of the block's forward, so it cannot drift from the hub code.</p>
 
 <h3>(b) Freeze + optimizer</h3>
 <pre><code>for p in model.parameters(): p.requires_grad_(False)
@@ -183,8 +192,8 @@ sanity check, then call <code>prune_moe_layer_inplace(...)</code> per layer. The
 
 <h2 id="decisions"><span class="n">3</span>Implementation decisions &amp; gotchas</h2>
 <ul>
-  <li><b>Monkeypatch, don't edit the model source.</b> The executed class is the hub copy, so editing the in-repo <code>modeling_emo.py</code> would have no effect. Patched instances re-implement the <code>num_shared_experts ≥ 0</code> paths faithfully; the <code>always_active_experts</code> masked path raises <code>NotImplementedError</code> (its semantics conflict with masking) — same stance as easy_ep.</li>
-  <li><b>Multiply the mask in float, before the bf16 cast.</b> The original forward casts <code>routing_weights</code> to the hidden dtype (bf16); applying the gate before that cast keeps the mask gradient out of the bf16 round-trip.</li>
+  <li><b>Hook the experts, don't edit (or reimplement) the model forward.</b> The executed class is the hub copy, so editing the in-repo <code>modeling_emo.py</code> would have no effect — and reimplementing the forward risks drift. Scaling each standard expert's output via a forward hook leaves the block forward verbatim. The <code>always_active_experts</code> masked path raises <code>NotImplementedError</code> at attach time (its semantics conflict with masking) — same stance as easy_ep.</li>
+  <li><b>The mask multiply naturally stays in float.</b> The expert output (bf16) times the float gate promotes to float32 for the op, so the mask gradient isn't degraded by a bf16 round-trip — and the result is re-cast to the hidden dtype inside the block's existing <code>index_add_</code>.</li>
   <li><b>Manual CE, router aux loss off.</b> Passing <code>labels</code> to the model would mix in the load-balancing aux loss; computing CE by hand isolates the task signal that should drive the masks.</li>
   <li><b>Penalty over <em>all</em> experts, not just selected ones.</b> Computed straight from the parameters, so experts that never appear in any token's top-k are still pushed toward 0.</li>
   <li><b>Shared experts are never masked.</b> Their gate is a fixed 1, matching the repo convention that shared experts occupy the trailing <code>num_shared</code> indices.</li>
@@ -222,6 +231,7 @@ before/after hidden-state sanity check passed in every run.</p>
     <tr><td><b>per_layer</b></td><td>16 cal / 50 steps</td><td>Every layer → keep_k = 32 (31 standard + 1 shared). Uniform, as designed. Artifact reloads via <code>AutoModelForCausalLM(trust_remote_code=True)</code>, <code>config.num_experts=32</code>, finite forward. <span class="tag ok">pass</span></td></tr>
     <tr><td><b>global</b></td><td>16 cal / 50 steps</td><td>Variable schedule summing to the exact budget (496 standard); learned a non-uniform allocation. <span class="tag ok">pass</span></td></tr>
     <tr><td><b>threshold</b></td><td>16 cal / 120 steps, &lambda;=0.2</td><td>Emergent count works; &lambda;=0.2 over-pruned (penalty crushed all gates by step ~24, CE rose 4.3→6.0), so every layer hit the &ldquo;never empty&rdquo; guard floor of 1+1. A clean demonstration of &lambda;-sensitivity. <span class="tag ok">pass</span></td></tr>
+    <tr><td><b>mask injection</b></td><td>parity test</td><td>The per-expert-hook masking (§2a) was checked against the earlier reimplemented-forward version on a real MoE block (float32): output <code>max|Δ|</code> ≈ 1e-6 (rel 1e-8), mask-gradient <code>max|Δ|</code> ≈ 3e-5 (rel 6e-8), identical gradient sparsity (70/127 experts). Numerically identical. <span class="tag ok">pass</span></td></tr>
   </tbody>
 </table>
 <div class="callout note">The 16-example / 50-step settings above are a <b>smoke configuration</b> — enough to exercise every code path and confirm artifacts, <b>not</b> enough to claim accuracy. Mask logits barely differentiate in 50 steps on 16 examples (<code>mean_gate</code> stayed ≈ 1.0, <code>frac(s≥0)=1.0</code>), so the per_layer selection there is close to arbitrary.</div>
@@ -280,22 +290,36 @@ finetuned cleanly (1 epoch, 70 steps) and evaluated through <code>launch_eval</c
   <li><b>Eval needs <code>trust_remote_code</code> passed explicitly.</b> For a raw checkpoint path (not in the model library), pass it through <code>launch_eval --model-args '{"trust_remote_code": true}'</code>.</li>
 </ul>
 
-<h2 id="status"><span class="n">9</span>Status &amp; next steps</h2>
+<h2 id="status"><span class="n">9</span>Matched comparison &amp; next steps</h2>
 <p><b>Done:</b> the method is implemented, committed, and verified across all three selection modes;
 the full pipeline (select → finetune → eval) works on a single H100.</p>
-<p><b>In progress <span class="tag wip">running</span>:</b> a <b>matched validation pair</b> — CS-<code>global</code> vs
-<code>easy_ep</code> at identical settings (keep_k=32, 1 shared, 256-example calibration, 3-epoch
-finetune, same eval) — to produce the first genuinely comparable arc_challenge numbers. <code>global</code>
-is the cell to watch, since it is the only mode that expresses the non-uniform allocation shown in §6.</p>
-<p><b>After that:</b> if a cell beats the baseline, a small grid (mode × &beta;-end × &lambda; in <code>threshold</code>)
-on arc_challenge, then scale to more tasks and keep_k values to trace the memory/accuracy Pareto
-frontier the method is meant to push out.</p>
+<p>The first genuinely comparable run — CS-<code>global</code> vs <code>easy_ep</code> at <b>identical settings</b>
+(keep_k=32, 1 shared, 256-example calibration, 3-epoch finetune, same eval):</p>
+<table>
+  <thead><tr><th>Method (matched)</th><th class="num">arc_challenge acc_uncond</th></tr></thead>
+  <tbody>
+    <tr><td>easy_ep</td><td class="num">0.535</td></tr>
+    <tr><td>CS-global</td><td class="num">0.334</td></tr>
+    <tr><td>uniform keep_k=32 (reference) / random</td><td class="num">0.545 / 0.25</td></tr>
+  </tbody>
+</table>
+<div class="callout warn"><b>Negative result for CS-global at this config.</b> CS-<code>global</code> (0.334) lands far
+below <code>easy_ep</code> (0.535), barely above chance. The likely cause is visible in §6: <code>global</code>
+ranks <var>s<sub>e</sub></var> <em>across</em> layers and spent its budget gutting the late layers (down to 7–8 of
+127 standard experts), which appears to wreck the model. Two plausible culprits — (1) <var>s<sub>e</sub></var>
+logits are not calibrated to be comparable across layers, so a global ranking is biased; (2) late
+layers are simply more sensitive than the allocation assumed. This is exactly why the comparison was
+run before any sweep.</div>
+<p><b>Next steps suggested by this:</b></p>
+<ul>
+  <li>Try <b>CS-<code>per_layer</code></b> in the same matched harness — it keeps the uniform budget easy_ep/uniform use, isolating &ldquo;loss-aware selection&rdquo; from &ldquo;non-uniform allocation.&rdquo; If per_layer ≈ easy_ep, the §6 allocation (not the CS selection) is what hurts.</li>
+  <li>Constrain <code>global</code>'s reallocation (e.g. a per-layer floor, or normalize <var>s<sub>e</sub></var> within each layer before the global ranking) so it can't gut late layers.</li>
+  <li>Only then a small grid (lr, num-steps, &beta;-end; &lambda; for <code>threshold</code>) and, if a cell beats baseline, scale to more tasks / keep_k values for a Pareto sweep.</li>
+</ul>
 
 <footer>
   Implementation reference for the EMO repo, <code>layerwise-shared-experts</code> branch.
-  Numbers are from single-H100 runs against <code>allenai/Emo_1b14b_1T</code> / <code>arc_challenge</code>;
-  the matched CS-vs-easy_ep comparison was still running when this was written and will be filled in
-  once complete.
+  Numbers are from single-H100 runs against <code>allenai/Emo_1b14b_1T</code> / <code>arc_challenge</code>.
 </footer>
 
 </div>

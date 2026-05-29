@@ -39,9 +39,7 @@ Usage:
 import argparse
 import json
 import logging
-import math
 import os
-import types
 from typing import List, Optional
 
 import torch
@@ -62,117 +60,35 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Monkeypatched MoE forward with CS mask injection
+# CS mask injection via per-expert output hooks
 # ---------------------------------------------------------------------------
-def _cs_moe_forward(self, hidden_states: torch.Tensor):
-    """
-    Re-implementation of ``EmoSparseMoeBlock.forward`` (modeling_emo.py:318) that
-    multiplies each *selected* expert's routing weight by ``sigma(beta * s_e)``
-    before the expert loop. Standard experts occupy indices
-    ``[0, num_experts - num_shared_experts)``; shared experts occupy the trailing
-    ``num_shared_experts`` indices and are gated at a fixed 1 (never pruned).
+# The CS gate scales each standard expert's *contribution* to the MoE output by
+# sigma(beta * s_e). The block computes that contribution as ``expert(x) * routing_weight``,
+# so scaling the expert's OUTPUT by sigma(beta * s_e) is identical to scaling its
+# routing weight:  mask_e * expert(x) * rw  ==  expert(x) * (mask_e * rw). We therefore
+# attach a forward hook to each standard expert that rescales its output, and leave the
+# block's own forward completely untouched (no reimplementation, so nothing can drift
+# from the executed hub copy of modeling_emo.py). Shared experts are simply left unhooked,
+# so their gate stays fixed at 1 and they are never pruned.
+def _make_expert_mask_hook(blk, e: int):
+    """Forward hook scaling standard-expert ``e``'s output by sigma(blk.cs_beta * s_e)."""
 
-    Only the ``num_shared_experts >= 0`` paths are supported (matching easy_ep);
-    the ``always_active_experts`` masked path raises NotImplementedError because
-    its always-active semantics conflict with masking. The return signature
-    ``(final_hidden_states, router_logits)`` and the ``norm_topk_prob`` branch are
-    preserved.
-    """
-    if self.always_active_experts is not None and len(self.always_active_experts) > 0:
-        raise NotImplementedError(
-            "Continuous sparsification does not support the always_active_experts "
-            "masked routing path; only num_shared_experts >= 0 is supported."
-        )
+    def hook(_module, _inputs, output):
+        return output * torch.sigmoid(blk.cs_beta * blk.cs_mask_logits[e])
 
-    batch_size, sequence_length, hidden_dim = hidden_states.shape
-    hidden_states = hidden_states.view(-1, hidden_dim)
-    # router_logits: (batch * sequence_length, n_experts)
-    router_logits = self.gate(hidden_states)
-
-    if self.num_shared_experts > 0:
-        router_logits_standard = router_logits[:, : -self.num_shared_experts]
-        router_logits_shared = router_logits[:, -self.num_shared_experts :]
-
-        routing_weights_standard = F.softmax(router_logits_standard, dim=1, dtype=torch.float)
-        routing_weights_shared = F.softmax(router_logits_shared, dim=1, dtype=torch.float)
-
-        routing_weights_standard, selected_experts_standard = torch.topk(
-            routing_weights_standard, self.top_k - self.num_shared_experts, dim=-1
-        )
-        routing_weights_shared, selected_experts_shared = torch.topk(
-            routing_weights_shared, self.num_shared_experts, dim=-1
-        )
-
-        routing_weights = torch.cat([routing_weights_standard, routing_weights_shared], dim=1)
-        selected_experts = torch.cat(
-            [
-                selected_experts_standard,
-                selected_experts_shared + (self.num_experts - self.num_shared_experts),
-            ],
-            dim=1,
-        )
-    else:
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-
-    if self.norm_topk_prob:
-        if self.num_shared_experts > 0:
-            raise NotImplementedError(
-                "norm_topk_prob is not implemented for the case where num_shared_experts > 0"
-            )
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
-    # --- CS mask injection -------------------------------------------------
-    # full_mask: (num_experts,) — sigma(beta * s_e) for standard experts, 1 for
-    # shared. Indexed by selected_experts (long) and applied to routing_weights
-    # while still in float (before the cast to hidden_states.dtype) so the mask
-    # gradient is not degraded by the bf16 round-trip.
-    mask_std = torch.sigmoid(self.cs_beta * self.cs_mask_logits)  # (num_standard,) float
-    if self.num_shared_experts > 0:
-        full_mask = torch.cat(
-            [
-                mask_std,
-                torch.ones(self.num_shared_experts, device=mask_std.device, dtype=mask_std.dtype),
-            ]
-        )
-    else:
-        full_mask = mask_std
-    routing_weights = routing_weights * full_mask[selected_experts]
-
-    # we cast back to the input dtype
-    routing_weights = routing_weights.to(hidden_states.dtype)
-
-    final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
-
-    expert_mask = torch.nn.functional.one_hot(
-        selected_experts, num_classes=self.num_experts
-    ).permute(2, 1, 0)
-
-    for expert_idx in range(self.num_experts):
-        expert_layer = self.experts[expert_idx]
-        idx, top_x = torch.where(expert_mask[expert_idx])
-
-        current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-        current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
-
-        final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-    return final_hidden_states, router_logits
+    return hook
 
 
 def _attach_cs_masks(model, num_layers: int, s_init: float, beta_start: float):
     """
     For every MoE layer: register a trainable ``cs_mask_logits`` Parameter of shape
     ``(num_standard,)`` initialised to ``s_init`` (so sigma(beta_start * s_init) ~ 1
-    — every expert starts fully on), store a mutable ``cs_beta`` float, and swap in
-    the CS forward. Returns (moe_blocks, original_forwards) for later restore.
+    — every expert starts fully on), store a mutable ``cs_beta`` float, and attach a
+    forward hook to each *standard* expert that scales its output by sigma(beta * s_e).
+    Returns (moe_blocks, hook_handles); call ``_remove_cs_hooks(hook_handles)`` to undo.
     """
     moe_blocks = []
-    original_forwards = []
+    hook_handles = []
     for layer_idx in range(num_layers):
         layer = model.model.layers[layer_idx]
         if not _is_moe_layer(layer):
@@ -190,16 +106,18 @@ def _attach_cs_masks(model, num_layers: int, s_init: float, beta_start: float):
             torch.full((num_standard,), float(s_init), dtype=torch.float, device=dev)
         )
         moe.cs_beta = float(beta_start)
-        original_forwards.append((moe, moe.forward))
-        moe.forward = types.MethodType(_cs_moe_forward, moe)
+        for e in range(num_standard):
+            hook_handles.append(moe.experts[e].register_forward_hook(_make_expert_mask_hook(moe, e)))
         moe_blocks.append(moe)
-    logger.info(f"Attached CS masks to {len(moe_blocks)} MoE layers")
-    return moe_blocks, original_forwards
+    logger.info(
+        f"Attached CS mask hooks to {len(moe_blocks)} MoE layers ({len(hook_handles)} experts)"
+    )
+    return moe_blocks, hook_handles
 
 
-def _restore_forwards(original_forwards):
-    for moe, fwd in original_forwards:
-        moe.forward = fwd
+def _remove_cs_hooks(hook_handles):
+    for h in hook_handles:
+        h.remove()
 
 
 def _beta_at_step(step: int, total_steps: int, beta_start: float, beta_end: float) -> float:
@@ -294,8 +212,8 @@ def continuous_sparsify_prune(
         generator=torch.Generator().manual_seed(prune_seed),
     )
 
-    # --- Attach CS masks & monkeypatch forward --------------------------------
-    moe_blocks, original_forwards = _attach_cs_masks(model, num_layers, s_init, beta_start)
+    # --- Attach CS mask hooks -------------------------------------------------
+    moe_blocks, hook_handles = _attach_cs_masks(model, num_layers, s_init, beta_start)
     if not moe_blocks:
         raise RuntimeError("No MoE layers found; nothing to sparsify.")
 
@@ -420,8 +338,8 @@ def continuous_sparsify_prune(
             f"+ {blk_by_layer[i].num_shared_experts} shared)"
         )
 
-    # --- Restore original forward before baking the structural prune ----------
-    _restore_forwards(original_forwards)
+    # --- Remove mask hooks before baking the structural prune -----------------
+    _remove_cs_hooks(hook_handles)
     for blk in moe_blocks:
         # Drop the training-only scaffold so it is not saved into the checkpoint.
         if hasattr(blk, "cs_mask_logits"):
